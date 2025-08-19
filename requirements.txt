@@ -1,0 +1,16 @@
+fastapi[all]
+scalar_fastapi
+uvicorn
+pandas
+python-dotenv
+requests
+matplotlib
+pytest
+pytest-cov
+pytest-asyncio
+httpx
+scrapy
+scrapegraphai
+lxml
+playwright
+pytest-playwright
