@@ -7,6 +7,7 @@ import os
 import time
 import subprocess
 import sys
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ def install_playwright_browsers():
 def sync_scrape(url: str) -> dict:
     """
     Synchronous scraping function with enhanced error handling
+    Focuses on extracting structured content (tables or articles)
     """
     # Install browsers first if needed
     try:
@@ -109,14 +111,15 @@ def sync_scrape(url: str) -> dict:
 
             logger.info(f"Navigating to URL: {url}")
 
-            # Try navigation with a simpler approach
+            # Try navigation with a wait for network to be mostly idle
             try:
-                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                page.goto(url, timeout=45000, wait_until="networkidle")
                 logger.info("Navigation successful")
             except PlaywrightTimeoutError:
                 logger.warning(
                     "Navigation timeout, but continuing with available content"
                 )
+                # Even if timeout, we might have some content
             except Exception as e:
                 logger.warning(
                     f"Navigation error: {e}, but continuing with available content"
@@ -137,29 +140,33 @@ def sync_scrape(url: str) -> dict:
             except Exception as e:
                 logger.warning(f"Error extracting description: {e}")
 
-            logger.info("Extracting links...")
-            links = []
-            try:
-                # More robust link extraction
-                link_elements = page.query_selector_all("a")
-                for link in link_elements:
-                    try:
-                        href = link.get_attribute("href")
-                        text = link.text_content() or ""
-                        if href and href.startswith(("http://", "https://", "/")):
-                            links.append({"text": text.strip(), "href": href})
-                    except Exception as e:
-                        logger.warning(f"Error processing link: {e}")
-                        continue
-            except Exception as e:
-                logger.warning(f"Error extracting links: {e}")
+            # Check if page has tables with data
+            tables = extract_structured_tables(page)
+            content_type = None
+            content = None
+
+            if tables and len(tables) > 0:
+                logger.info("Table(s) found on page, extracting table data")
+                content_type = "table"
+                content = tables
+            else:
+                logger.info("No tables found, extracting article content")
+                content_type = "article"
+                content = extract_article_content(page)
+
+            # Extract links
+            links = extract_structured_links(page, url)
 
             logger.info("Scraping completed successfully")
 
             return {
-                "url": url,
-                "title": title,
-                "description": description,
+                "metadata": {
+                    "url": url,
+                    "title": title,
+                    "description": description,
+                    "content_type": content_type,
+                },
+                "content": content,
                 "links": links,
             }
 
@@ -175,6 +182,272 @@ def sync_scrape(url: str) -> dict:
                 browser.close()
             except Exception as e:
                 logger.warning(f"Error closing browser: {e}")
+
+
+def extract_structured_tables(page):
+    """
+    Extract structured data from tables on the page
+    """
+    tables = []
+
+    try:
+        # Find all tables on the page
+        table_elements = page.query_selector_all("table")
+
+        for i, table in enumerate(table_elements):
+            try:
+                # Check if table has meaningful content
+                rows = table.query_selector_all("tr")
+                if len(rows) < 2:  # Skip tables with less than 2 rows
+                    continue
+
+                # Extract caption if available
+                caption_element = table.query_selector("caption")
+                caption = caption_element.inner_text() if caption_element else None
+
+                # Extract headers
+                headers = []
+                header_row = table.query_selector("thead tr") or rows[0]
+                header_cells = header_row.query_selector_all("th, td")
+
+                for cell in header_cells:
+                    headers.append(
+                        cell.inner_text().strip() or f"Column {len(headers) + 1}"
+                    )
+
+                # Extract rows
+                table_rows = []
+                body_rows = (
+                    table.query_selector_all("tbody tr")
+                    if table.query_selector("tbody")
+                    else rows
+                )
+
+                # Skip header row if it was in the body
+                start_idx = (
+                    1 if not table.query_selector("thead") and header_row in rows else 0
+                )
+
+                for row in body_rows[start_idx:]:
+                    row_data = []
+                    cells = row.query_selector_all("td, th")
+
+                    for cell in cells:
+                        # Check for rowspan and colspan
+                        rowspan = int(cell.get_attribute("rowspan") or 1)
+                        colspan = int(cell.get_attribute("colspan") or 1)
+
+                        cell_text = cell.inner_text().strip()
+                        row_data.append(
+                            {"value": cell_text, "rowspan": rowspan, "colspan": colspan}
+                        )
+
+                    if row_data:
+                        table_rows.append(row_data)
+
+                if table_rows:  # Only add tables with data
+                    tables.append(
+                        {
+                            "table_index": i,
+                            "caption": caption,
+                            "headers": headers,
+                            "rows": table_rows,
+                            "summary": f"Table with {len(headers)} columns and {len(table_rows)} rows",
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"Error extracting table {i}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error in table extraction: {e}")
+
+    return tables
+
+
+def extract_article_content(page):
+    """
+    Extract structured article content from the page
+    """
+    try:
+        # Try to find article using common selectors
+        article_selectors = [
+            "article",
+            "main",
+            '[role="main"]',
+            ".article",
+            ".content",
+            ".post",
+            ".blog-post",
+            ".story",
+            "#content",
+            "#main",
+            "#article",
+        ]
+
+        article_element = None
+
+        for selector in article_selectors:
+            article_element = page.query_selector(selector)
+            if article_element:
+                break
+
+        # If no article found, use body
+        if not article_element:
+            article_element = page.query_selector("body")
+
+        if not article_element:
+            return {"sections": [], "text": ""}
+
+        # Extract structured content
+        sections = []
+        current_section = {"heading": None, "paragraphs": []}
+
+        # Get all elements within the article
+        elements = article_element.query_selector_all("*")
+
+        for element in elements:
+            tag_name = element.evaluate("el => el.tagName.toLowerCase()")
+
+            if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+                # New section found
+                if current_section["paragraphs"] or current_section["heading"]:
+                    sections.append(current_section)
+
+                current_section = {
+                    "heading": element.inner_text(),
+                    "level": int(tag_name[1]),
+                    "paragraphs": [],
+                }
+            elif tag_name in ["p", "div"]:
+                # Paragraph content
+                text = element.inner_text().strip()
+                if text and len(text) > 30 and not is_noisy_text(text):
+                    current_section["paragraphs"].append(text)
+            elif tag_name in ["ul", "ol"]:
+                # List content
+                list_items = [
+                    li.inner_text().strip() for li in element.query_selector_all("li")
+                ]
+                list_items = [item for item in list_items if item and len(item) > 10]
+
+                if list_items:
+                    current_section["paragraphs"].append(
+                        {
+                            "list_type": "ordered" if tag_name == "ol" else "unordered",
+                            "items": list_items,
+                        }
+                    )
+
+        # Add the last section
+        if current_section["paragraphs"] or current_section["heading"]:
+            sections.append(current_section)
+
+        # Extract full text for completeness
+        full_text = article_element.inner_text()
+        full_text = re.sub(r"\n\s*\n", "\n\n", full_text)
+
+        return {
+            "sections": sections,
+            "text": full_text,
+            "section_count": len(sections),
+            "paragraph_count": sum(len(section["paragraphs"]) for section in sections),
+        }
+
+    except Exception as e:
+        logger.error(f"Error extracting article content: {e}")
+        return {"sections": [], "text": "", "error": str(e)}
+
+
+def extract_structured_links(page, base_url):
+    """
+    Extract structured link information
+    """
+    links = []
+
+    try:
+        link_elements = page.query_selector_all("a[href]")
+
+        for link in link_elements:
+            try:
+                href = link.get_attribute("href")
+                text = link.inner_text().strip()
+
+                # Skip navigation and noisy links
+                if not text or is_noisy_text(text):
+                    continue
+
+                # Make relative URLs absolute
+                if href.startswith("/"):
+                    from urllib.parse import urljoin
+
+                    href = urljoin(base_url, href)
+
+                # Only include HTTP/HTTPS links
+                if href.startswith(("http://", "https://")):
+                    links.append(
+                        {
+                            "text": text,
+                            "url": href,
+                            "is_external": not href.startswith(base_url),
+                            "text_length": len(text),
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"Error processing link: {e}")
+                continue
+
+        # Sort by text length (longer texts are usually more meaningful)
+        links.sort(key=lambda x: x["text_length"], reverse=True)
+
+    except Exception as e:
+        logger.error(f"Error extracting links: {e}")
+
+    return links
+
+
+def is_noisy_text(text):
+    """
+    Check if text is likely noise (navigation, ads, etc.)
+    """
+    text = text.lower().strip()
+
+    # Common navigation phrases
+    navigation_phrases = [
+        "home",
+        "about",
+        "contact",
+        "login",
+        "sign up",
+        "register",
+        "privacy policy",
+        "terms of service",
+        "cookie policy",
+        "follow us",
+        "subscribe",
+        "newsletter",
+        "advertisement",
+        "related articles",
+        "you might also like",
+        "popular posts",
+        "categories",
+        "tags",
+        "archives",
+        "search",
+        "menu",
+        "navigation",
+    ]
+
+    # Check if text contains navigation phrases
+    for phrase in navigation_phrases:
+        if phrase in text:
+            return True
+
+    # Check if text is very short or looks like a button/link
+    if len(text) < 25 and (text.isupper() or ">" in text or "→" in text or "›" in text):
+        return True
+
+    return False
 
 
 async def scrape_page(url: str) -> dict:

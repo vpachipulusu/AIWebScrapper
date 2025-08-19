@@ -14,3 +14,4 @@ scrapegraphai
 lxml
 playwright
 pytest-playwright
+selectolax

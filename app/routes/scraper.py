@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
 from app.services.playwright_service import scrape_page
 from app.services.scraper_service import run_scraper
+from app.services.selectolax_service import scrape_page as selectolax_scrape_page
 
 router = APIRouter()
 
@@ -27,4 +28,9 @@ async def scrape_and_analyze(request: ScrapeRequest):
 @router.post("/playwright-scrape")
 async def scrape_endpoint(url: str = Query(..., description="URL to scrape")):
     data = await scrape_page(url)
+    return data
+
+@router.post("/selectolax-scrape")
+async def selectolax_scrape_endpoint(url: str = Query(..., description="URL to scrape")):
+    data = await selectolax_scrape_page(url)
     return data
