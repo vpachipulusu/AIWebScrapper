@@ -10,9 +10,35 @@ import sys
 import re
 from urllib.parse import urljoin
 from typing import Dict, List, Optional, Union
+from enum import Enum
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# Define content types that can be extracted
+class ContentType(str, Enum):
+    TABLES = "tables"
+    LISTS = "lists"
+    ARTICLES = "articles"
+    KEY_POINTS = "key_points"
+    EXPLANATIONS = "explanations"
+    LINKS = "links"
+    METADATA = "metadata"
+
+
+# Request model for the API
+class ScrapeRequest(BaseModel):
+    url: str
+    content_types: List[ContentType] = [
+        ContentType.TABLES,
+        ContentType.LISTS,
+        ContentType.ARTICLES,
+        ContentType.METADATA,
+    ]
+    timeout: int = 30
+    wait_after_load: int = 2
 
 
 def install_playwright_browsers():
@@ -39,10 +65,9 @@ def install_playwright_browsers():
         raise Exception(f"Failed to install Playwright browsers: {e}")
 
 
-def sync_scrape(url: str) -> dict:
+def sync_scrape(request: ScrapeRequest) -> dict:
     """
-    Synchronous scraping function with enhanced error handling
-    Focuses on extracting structured content (tables, articles, or lists)
+    Synchronous scraping function with user-selectable content extraction
     """
     # Install browsers first if needed
     try:
@@ -65,7 +90,8 @@ def sync_scrape(url: str) -> dict:
 
     browser = None
     try:
-        logger.info(f"Starting sync scrape for URL: {url}")
+        logger.info(f"Starting sync scrape for URL: {request.url}")
+        logger.info(f"Content types to extract: {request.content_types}")
 
         with sync_playwright() as p:
             logger.info("Launching browser...")
@@ -111,11 +137,15 @@ def sync_scrape(url: str) -> dict:
             # Set viewport size
             page.set_viewport_size({"width": 1366, "height": 768})
 
-            logger.info(f"Navigating to URL: {url}")
+            logger.info(f"Navigating to URL: {request.url}")
 
             # Try navigation with a wait for network to be mostly idle
             try:
-                page.goto(url, timeout=45000, wait_until="networkidle")
+                page.goto(
+                    request.url,
+                    timeout=request.timeout * 1000,
+                    wait_until="networkidle",
+                )
                 logger.info("Navigation successful")
             except PlaywrightTimeoutError:
                 logger.warning(
@@ -128,74 +158,60 @@ def sync_scrape(url: str) -> dict:
                 )
 
             # Wait a bit after navigation to ensure content is loaded
-            time.sleep(3)
+            time.sleep(request.wait_after_load)
 
-            logger.info("Extracting page title...")
-            title = page.title()
+            # Initialize result dictionary
+            result = {}
 
-            logger.info("Extracting description...")
-            description = None
-            try:
-                description_element = page.locator("meta[name='description']")
-                if description_element.count() > 0:
-                    description = description_element.get_attribute("content")
-            except Exception as e:
-                logger.warning(f"Error extracting description: {e}")
+            # Extract metadata if requested
+            if ContentType.METADATA in request.content_types:
+                logger.info("Extracting metadata...")
+                result["metadata"] = extract_metadata(page, request.url)
 
-            # Check if page has tables with data
-            tables = extract_structured_tables(page)
-            content_type = None
-            content = None
+            # Extract tables if requested
+            if ContentType.TABLES in request.content_types:
+                logger.info("Extracting tables...")
+                tables = extract_structured_tables(page)
+                if tables:
+                    result["tables"] = tables
 
-            if tables and len(tables) > 0:
-                logger.info(
-                    f"Found {len(tables)} table(s) on page, extracting table data"
-                )
-                content_type = "table"
-                content = {
-                    "tables": tables,
-                    "table_count": len(tables),
-                    "total_rows": sum(len(table["rows"]) for table in tables),
-                }
-            else:
-                # Check if page has lists with data
+            # Extract lists if requested
+            if ContentType.LISTS in request.content_types:
+                logger.info("Extracting lists...")
                 lists = extract_structured_lists(page)
-                if lists and len(lists) > 0:
-                    logger.info(
-                        f"Found {len(lists)} list(s) on page, extracting list data"
-                    )
-                    content_type = "list"
-                    content = {
-                        "lists": lists,
-                        "list_count": len(lists),
-                        "total_items": sum(len(lst["items"]) for lst in lists),
-                    }
-                else:
-                    logger.info("No tables or lists found, extracting article content")
-                    content_type = "article"
-                    content = extract_article_content(page)
+                if lists:
+                    result["lists"] = lists
 
-            # Extract key points and explanations if available
-            key_points = extract_key_points(page)
-            explanations = extract_explanations(page)
+            # Extract articles if requested
+            if ContentType.ARTICLES in request.content_types:
+                logger.info("Extracting articles...")
+                article = extract_article_content(page)
+                if article and (article.get("sections") or article.get("text")):
+                    result["article"] = article
 
-            # Extract links
-            links = extract_structured_links(page, url)
+            # Extract key points if requested
+            if ContentType.KEY_POINTS in request.content_types:
+                logger.info("Extracting key points...")
+                key_points = extract_key_points(page)
+                if key_points:
+                    result["key_points"] = key_points
+
+            # Extract explanations if requested
+            if ContentType.EXPLANATIONS in request.content_types:
+                logger.info("Extracting explanations...")
+                explanations = extract_explanations(page)
+                if explanations:
+                    result["explanations"] = explanations
+
+            # Extract links if requested
+            if ContentType.LINKS in request.content_types:
+                logger.info("Extracting links...")
+                links = extract_structured_links(page, request.url)
+                if links:
+                    result["links"] = links[:20]  # Limit to top 20 links
 
             logger.info("Scraping completed successfully")
-
-            return {
-                "metadata": {
-                    "url": url,
-                    "title": title,
-                    "description": description,
-                    "content_type": content_type,
-                },
-                "content": content,
-                "key_points": key_points,
-                "explanations": explanations,
-                "links": links[:20],  # Limit to top 20 links
-            }
+            return result
 
     except Exception as e:
         logger.error(f"Error in sync_scrape: {str(e)}")
@@ -208,7 +224,36 @@ def sync_scrape(url: str) -> dict:
             try:
                 browser.close()
             except Exception as e:
-                logger.warning(f"Error closing browser: {e}")
+                # Ignore "Event loop is closed" errors as they're usually harmless
+                if "Event loop is closed" not in str(e):
+                    logger.warning(f"Error closing browser: {e}")
+
+
+def extract_metadata(page, url):
+    """
+    Extract metadata from the page
+    """
+    try:
+        logger.info("Extracting page title...")
+        title = page.title()
+
+        logger.info("Extracting description...")
+        description = None
+        try:
+            description_element = page.locator("meta[name='description']")
+            if description_element.count() > 0:
+                description = description_element.get_attribute("content")
+        except Exception as e:
+            logger.warning(f"Error extracting description: {e}")
+
+        return {
+            "url": url,
+            "title": title,
+            "description": description,
+        }
+    except Exception as e:
+        logger.error(f"Error extracting metadata: {e}")
+        return {"error": str(e)}
 
 
 def extract_structured_tables(page):
@@ -310,16 +355,14 @@ def extract_structured_lists(page):
                     continue
 
                 # Determine list type
-                list_type = (
-                    "unordered"
-                    if list_element.evaluate("el => el.tagName.toLowerCase()") == "ul"
-                    else "ordered"
-                )
+                list_type = "unordered"
+                if list_element.evaluate("el => el.tagName.toLowerCase()") == "ol":
+                    list_type = "ordered"
 
                 # Extract list items
                 list_items = []
                 for item in items:
-                    item_text = item.inner_text().strip()
+                    item_text = item.text_content().strip()
                     if (
                         item_text and len(item_text) > 2
                     ):  # Skip empty or very short items
@@ -350,39 +393,49 @@ def extract_structured_lists(page):
 
 def find_list_context(list_element):
     """
-    Try to find context or heading for a list
+    Try to find context or heading for a list using Playwright's JavaScript evaluation
     """
     try:
-        # Look for previous sibling that might be a heading
-        previous_element = list_element.evaluate("el => el.previousElementSibling")
-        if previous_element:
-            tag_name = previous_element.evaluate("el => el.tagName.toLowerCase()")
-            if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-                return previous_element.evaluate("el => el.innerText")
+        # Use JavaScript evaluation to find context
+        context = list_element.evaluate("""
+            (el) => {
+                // Look for previous sibling that might be a heading
+                let previous = el.previousElementSibling;
+                if (previous) {
+                    let tagName = previous.tagName.toLowerCase();
+                    if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
+                        return previous.innerText;
+                    }
+                    
+                    // Check if previous element has a class that suggests it's a heading
+                    let className = previous.className || '';
+                    if (className.includes('title') || className.includes('heading') || 
+                        className.includes('header') || className.includes('caption')) {
+                        return previous.innerText;
+                    }
+                }
+                
+                // Look for parent element that might provide context
+                let parent = el.parentElement;
+                if (parent) {
+                    // Check if parent has a class that suggests it's a content container
+                    let parentClassName = parent.className || '';
+                    if (parentClassName.includes('content') || parentClassName.includes('section') || 
+                        parentClassName.includes('article') || parentClassName.includes('block') || 
+                        parentClassName.includes('box')) {
+                        // Look for a heading within the parent
+                        let heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
+                        if (heading) {
+                            return heading.innerText;
+                        }
+                    }
+                }
+                
+                return null;
+            }
+        """)
 
-            # Check if previous element has a class that suggests it's a heading
-            class_name = previous_element.evaluate("el => el.className || ''")
-            if any(
-                keyword in class_name.lower()
-                for keyword in ["title", "heading", "header", "caption"]
-            ):
-                return previous_element.evaluate("el => el.innerText")
-
-        # Look for parent element that might provide context
-        parent = list_element.evaluate("el => el.parentElement")
-        if parent:
-            # Check if parent has a class that suggests it's a content container
-            class_name = parent.evaluate("el => el.className || ''")
-            if any(
-                keyword in class_name.lower()
-                for keyword in ["content", "section", "article", "block", "box"]
-            ):
-                # Look for a heading within the parent
-                heading = parent.query_selector("h1, h2, h3, h4, h5, h6")
-                if heading:
-                    return heading.inner_text()
-
-        return None
+        return context
     except Exception as e:
         logger.warning(f"Error finding list context: {e}")
         return None
@@ -653,7 +706,29 @@ def is_noisy_text(text):
     return False
 
 
-async def scrape_page(url: str) -> dict:
+async def scrape_all_page(url: str) -> dict:
+    """
+    Async wrapper for the synchronous scraping function
+    """
+    try:
+        # Use a thread pool executor to run synchronous code
+        loop = asyncio.get_event_loop()
+        # Construct ScrapeRequest from url
+        request = ScrapeRequest(url=url)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = await loop.run_in_executor(executor, sync_scrape, request)
+            return result
+
+    except Exception as e:
+        error_msg = str(e) if str(e) else "Unknown error occurred during scraping"
+        logger.error(f"Error in scrape_page: {error_msg}")
+        logger.error(traceback.format_exc())
+
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+async def scrape_specific_page_content(request: ScrapeRequest) -> dict:
     """
     Async wrapper for the synchronous scraping function
     """
@@ -662,7 +737,7 @@ async def scrape_page(url: str) -> dict:
         loop = asyncio.get_event_loop()
 
         with ThreadPoolExecutor(max_workers=1) as executor:
-            result = await loop.run_in_executor(executor, sync_scrape, url)
+            result = await loop.run_in_executor(executor, sync_scrape, request)
             return result
 
     except Exception as e:
