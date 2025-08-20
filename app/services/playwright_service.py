@@ -8,6 +8,7 @@ import time
 import subprocess
 import sys
 import re
+from urllib.parse import urljoin
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ def sync_scrape(url: str) -> dict:
             # Set a user agent to avoid blocking
             page.set_extra_http_headers(
                 {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
                 }
             )
 
@@ -126,7 +127,7 @@ def sync_scrape(url: str) -> dict:
                 )
 
             # Wait a bit after navigation to ensure content is loaded
-            time.sleep(2)
+            time.sleep(3)
 
             logger.info("Extracting page title...")
             title = page.title()
@@ -146,13 +147,23 @@ def sync_scrape(url: str) -> dict:
             content = None
 
             if tables and len(tables) > 0:
-                logger.info("Table(s) found on page, extracting table data")
+                logger.info(
+                    f"Found {len(tables)} table(s) on page, extracting table data"
+                )
                 content_type = "table"
-                content = tables
+                content = {
+                    "tables": tables,
+                    "table_count": len(tables),
+                    "total_rows": sum(len(table["rows"]) for table in tables),
+                }
             else:
                 logger.info("No tables found, extracting article content")
                 content_type = "article"
                 content = extract_article_content(page)
+
+            # Extract key points and explanations if available
+            key_points = extract_key_points(page)
+            explanations = extract_explanations(page)
 
             # Extract links
             links = extract_structured_links(page, url)
@@ -167,7 +178,9 @@ def sync_scrape(url: str) -> dict:
                     "content_type": content_type,
                 },
                 "content": content,
-                "links": links,
+                "key_points": key_points,
+                "explanations": explanations,
+                "links": links[:20],  # Limit to top 20 links
             }
 
     except Exception as e:
@@ -359,6 +372,72 @@ def extract_article_content(page):
         return {"sections": [], "text": "", "error": str(e)}
 
 
+def extract_key_points(page):
+    """
+    Extract key points or important information from the page
+    """
+    key_points = []
+
+    try:
+        # Look for key points using common selectors
+        key_point_selectors = [
+            ".key-point",
+            ".important",
+            ".highlight",
+            ".note",
+            ".tip",
+            ".alert",
+            "[data-important]",
+            "strong",
+            "b",
+        ]
+
+        for selector in key_point_selectors:
+            elements = page.query_selector_all(selector)
+            for element in elements:
+                text = element.inner_text().strip()
+                if text and len(text) > 10 and not is_noisy_text(text):
+                    key_points.append(text)
+
+        # Remove duplicates
+        key_points = list(set(key_points))
+
+    except Exception as e:
+        logger.error(f"Error extracting key points: {e}")
+
+    return key_points
+
+
+def extract_explanations(page):
+    """
+    Extract explanations or descriptive text from the page
+    """
+    explanations = []
+
+    try:
+        # Look for explanations using common selectors
+        explanation_selectors = [
+            ".explanation",
+            ".description",
+            ".instruction",
+            ".guide",
+            ".tutorial",
+            ".help-text",
+        ]
+
+        for selector in explanation_selectors:
+            elements = page.query_selector_all(selector)
+            for element in elements:
+                text = element.inner_text().strip()
+                if text and len(text) > 20 and not is_noisy_text(text):
+                    explanations.append(text)
+
+    except Exception as e:
+        logger.error(f"Error extracting explanations: {e}")
+
+    return explanations
+
+
 def extract_structured_links(page, base_url):
     """
     Extract structured link information
@@ -379,8 +458,6 @@ def extract_structured_links(page, base_url):
 
                 # Make relative URLs absolute
                 if href.startswith("/"):
-                    from urllib.parse import urljoin
-
                     href = urljoin(base_url, href)
 
                 # Only include HTTP/HTTPS links
@@ -410,6 +487,9 @@ def is_noisy_text(text):
     """
     Check if text is likely noise (navigation, ads, etc.)
     """
+    if not text:
+        return True
+
     text = text.lower().strip()
 
     # Common navigation phrases
@@ -436,6 +516,11 @@ def is_noisy_text(text):
         "search",
         "menu",
         "navigation",
+        "cookie",
+        "accept",
+        "decline",
+        "skip to content",
+        "skip to main",
     ]
 
     # Check if text contains navigation phrases
