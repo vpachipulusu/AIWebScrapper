@@ -9,9 +9,9 @@ import subprocess
 import sys
 import re
 from urllib.parse import urljoin
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,19 +26,50 @@ class ContentType(str, Enum):
     EXPLANATIONS = "explanations"
     LINKS = "links"
     METADATA = "metadata"
+    CUSTOM = "custom"
+
+
+# Define selector types
+class SelectorType(str, Enum):
+    CSS = "css"
+    XPATH = "xpath"
+
+
+# Model for custom selectors
+class CustomSelector(BaseModel):
+    name: str = Field(..., description="Name for this selector (e.g., 'product_title')")
+    selector: str = Field(..., description="The CSS selector or XPath expression")
+    selector_type: SelectorType = Field(
+        SelectorType.CSS, description="Type of selector"
+    )
+    extract: str = Field(
+        "text", description="What to extract: 'text', 'html', 'attribute', or 'all'"
+    )
+    attribute: Optional[str] = Field(
+        None, description="If extract='attribute', which attribute to extract"
+    )
 
 
 # Request model for the API
 class ScrapeRequest(BaseModel):
     url: str
-    content_types: List[ContentType] = [
-        ContentType.TABLES,
-        ContentType.LISTS,
-        ContentType.ARTICLES,
-        ContentType.METADATA,
-    ]
-    timeout: int = 30
-    wait_after_load: int = 2
+    content_types: List[ContentType] = Field(
+        default=[
+            ContentType.TABLES,
+            ContentType.LISTS,
+            ContentType.ARTICLES,
+            ContentType.METADATA,
+        ],
+        description="Types of content to extract",
+    )
+    custom_selectors: List[CustomSelector] = Field(
+        default=[], description="Custom selectors for extracting specific content"
+    )
+    timeout: int = Field(30, description="Timeout in seconds")
+    wait_after_load: int = Field(2, description="Seconds to wait after page load")
+    return_html: bool = Field(
+        False, description="Whether to return raw HTML for analysis"
+    )
 
 
 def install_playwright_browsers():
@@ -68,6 +99,7 @@ def install_playwright_browsers():
 def sync_scrape(request: ScrapeRequest) -> dict:
     """
     Synchronous scraping function with user-selectable content extraction
+    and custom selector support
     """
     # Install browsers first if needed
     try:
@@ -92,6 +124,10 @@ def sync_scrape(request: ScrapeRequest) -> dict:
     try:
         logger.info(f"Starting sync scrape for URL: {request.url}")
         logger.info(f"Content types to extract: {request.content_types}")
+        if request.custom_selectors:
+            logger.info(
+                f"Custom selectors: {[s.name for s in request.custom_selectors]}"
+            )
 
         with sync_playwright() as p:
             logger.info("Launching browser...")
@@ -210,6 +246,18 @@ def sync_scrape(request: ScrapeRequest) -> dict:
                 if links:
                     result["links"] = links[:20]  # Limit to top 20 links
 
+            # Extract custom content if requested
+            if ContentType.CUSTOM in request.content_types and request.custom_selectors:
+                logger.info("Extracting custom content...")
+                custom_content = extract_custom_content(page, request.custom_selectors)
+                if custom_content:
+                    result["custom"] = custom_content
+
+            # Return HTML for analysis if requested
+            if request.return_html:
+                logger.info("Extracting HTML for analysis...")
+                result["html"] = extract_html_for_analysis(page)
+
             logger.info("Scraping completed successfully")
             return result
 
@@ -228,6 +276,150 @@ def sync_scrape(request: ScrapeRequest) -> dict:
                 if "Event loop is closed" not in str(e):
                     logger.warning(f"Error closing browser: {e}")
 
+
+def extract_custom_content(
+    page, custom_selectors: List[CustomSelector]
+) -> Dict[str, Any]:
+    """
+    Extract content using custom CSS selectors or XPaths
+    """
+    custom_content = {}
+
+    for selector_def in custom_selectors:
+        try:
+            elements = []
+
+            if selector_def.selector_type == SelectorType.CSS:
+                elements = page.query_selector_all(selector_def.selector)
+            elif selector_def.selector_type == SelectorType.XPATH:
+                # For XPath, we need to use a different approach
+                try:
+                    elements = page.query_selector_all(f"xpath={selector_def.selector}")
+                except:
+                    # Fallback to evaluate for complex XPath expressions
+                    elements = page.evaluate(f"""() => {{
+                        const results = [];
+                        const nodes = document.evaluate('{selector_def.selector}', document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                        for (let i = 0; i < nodes.snapshotLength; i++) {{
+                            results.push(nodes.snapshotItem(i));
+                        }}
+                        return results;
+                    }}""")
+
+            if not elements:
+                custom_content[selector_def.name] = None
+                continue
+
+            extracted_data = []
+
+            for element in elements:
+                try:
+                    if selector_def.extract == "text":
+                        text = element.text_content()
+                        extracted_data.append(text.strip() if text else "")
+                    elif selector_def.extract == "html":
+                        html = element.inner_html()
+                        extracted_data.append(html)
+                    elif selector_def.extract == "attribute" and selector_def.attribute:
+                        attr_value = element.get_attribute(selector_def.attribute)
+                        extracted_data.append(attr_value if attr_value else "")
+                    elif selector_def.extract == "all":
+                        # Extract both text and HTML
+                        text = element.text_content()
+                        html = element.inner_html()
+                        extracted_data.append(
+                            {"text": text.strip() if text else "", "html": html}
+                        )
+                    else:
+                        # Default to text
+                        text = element.text_content()
+                        extracted_data.append(text.strip() if text else "")
+                except Exception as e:
+                    logger.error(
+                        f"Error extracting content from element with selector '{selector_def.name}': {e}"
+                    )
+                    extracted_data.append(f"Error: {str(e)}")
+
+            # If only one element found, return it directly instead of as a list
+            if len(extracted_data) == 1:
+                custom_content[selector_def.name] = extracted_data[0]
+            else:
+                custom_content[selector_def.name] = extracted_data
+
+        except Exception as e:
+            logger.error(
+                f"Error extracting content with selector '{selector_def.name}': {e}"
+            )
+            custom_content[selector_def.name] = f"Error: {str(e)}"
+
+    return custom_content
+
+def extract_html_for_analysis(page) -> Dict[str, Any]:
+    """
+    Extract HTML structure for analysis to help users create selectors
+    """
+    try:
+        # Get the main content areas
+        body_html = page.query_selector("body").inner_html()
+
+        # Find all unique CSS classes and IDs for analysis
+        classes_and_ids = page.evaluate("""
+            () => {
+                const allElements = document.querySelectorAll('*');
+                const classes = new Set();
+                const ids = new Set();
+                
+                allElements.forEach(el => {
+                    // Handle className - it might not always be a string
+                    if (el.className) {
+                        let className = el.className;
+                        // Handle cases where className is not a string (e.g., SVG elements)
+                        if (typeof className === 'string') {
+                            className.split(' ').forEach(cls => {
+                                if (cls) classes.add(cls);
+                            });
+                        } else if (className.baseVal) {
+                            // Handle SVG elements which have className as SVGAnimatedString
+                            className.baseVal.split(' ').forEach(cls => {
+                                if (cls) classes.add(cls);
+                            });
+                        }
+                    }
+                    if (el.id) ids.add(el.id);
+                });
+                
+                return {
+                    classes: Array.from(classes),
+                    ids: Array.from(ids)
+                };
+            }
+        """)
+
+        # Get common content containers
+        content_containers = {}
+        container_selectors = {
+            "articles": "article",
+            "main_content": "main, [role='main'], .main, #main, .content, #content",
+            "headers": "h1, h2, h3, h4, h5, h6",
+            "tables": "table",
+            "lists": "ul, ol",
+        }
+
+        for name, selector in container_selectors.items():
+            elements = page.query_selector_all(selector)
+            content_containers[name] = len(elements)
+
+        return {
+            "structure": content_containers,
+            "classes": classes_and_ids["classes"],
+            "ids": classes_and_ids["ids"],
+            "body_html": body_html[:5000] + "..."
+            if len(body_html) > 5000
+            else body_html,  # Limit size
+        }
+    except Exception as e:
+        logger.error(f"Error extracting HTML for analysis: {e}")
+        return {"error": str(e)}
 
 def extract_metadata(page, url):
     """
@@ -254,7 +446,6 @@ def extract_metadata(page, url):
     except Exception as e:
         logger.error(f"Error extracting metadata: {e}")
         return {"error": str(e)}
-
 
 def extract_structured_tables(page):
     """
@@ -336,7 +527,6 @@ def extract_structured_tables(page):
 
     return tables
 
-
 def extract_structured_lists(page):
     """
     Extract structured data from lists on the page
@@ -390,7 +580,6 @@ def extract_structured_lists(page):
 
     return lists
 
-
 def find_list_context(list_element):
     """
     Try to find context or heading for a list using Playwright's JavaScript evaluation
@@ -402,16 +591,24 @@ def find_list_context(list_element):
                 // Look for previous sibling that might be a heading
                 let previous = el.previousElementSibling;
                 if (previous) {
-                    let tagName = previous.tagName.toLowerCase();
+                    let tagName = previous.tagName ? previous.tagName.toLowerCase() : '';
                     if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
-                        return previous.innerText;
+                        return previous.innerText || previous.textContent;
                     }
                     
                     // Check if previous element has a class that suggests it's a heading
                     let className = previous.className || '';
-                    if (className.includes('title') || className.includes('heading') || 
-                        className.includes('header') || className.includes('caption')) {
-                        return previous.innerText;
+                    if (typeof className === 'string') {
+                        if (className.includes('title') || className.includes('heading') || 
+                            className.includes('header') || className.includes('caption')) {
+                            return previous.innerText || previous.textContent;
+                        }
+                    } else if (className.baseVal) {
+                        // Handle SVG elements
+                        if (className.baseVal.includes('title') || className.baseVal.includes('heading') || 
+                            className.baseVal.includes('header') || className.baseVal.includes('caption')) {
+                            return previous.innerText || previous.textContent;
+                        }
                     }
                 }
                 
@@ -420,13 +617,25 @@ def find_list_context(list_element):
                 if (parent) {
                     // Check if parent has a class that suggests it's a content container
                     let parentClassName = parent.className || '';
-                    if (parentClassName.includes('content') || parentClassName.includes('section') || 
-                        parentClassName.includes('article') || parentClassName.includes('block') || 
-                        parentClassName.includes('box')) {
-                        // Look for a heading within the parent
-                        let heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
-                        if (heading) {
-                            return heading.innerText;
+                    if (typeof parentClassName === 'string') {
+                        if (parentClassName.includes('content') || parentClassName.includes('section') || 
+                            parentClassName.includes('article') || parentClassName.includes('block') || 
+                            parentClassName.includes('box')) {
+                            // Look for a heading within the parent
+                            let heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
+                            if (heading) {
+                                return heading.innerText || heading.textContent;
+                            }
+                        }
+                    } else if (parentClassName.baseVal) {
+                        // Handle SVG elements
+                        if (parentClassName.baseVal.includes('content') || parentClassName.baseVal.includes('section') || 
+                            parentClassName.baseVal.includes('article') || parentClassName.baseVal.includes('block') || 
+                            parentClassName.baseVal.includes('box')) {
+                            let heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
+                            if (heading) {
+                                return heading.innerText || heading.textContent;
+                            }
                         }
                     }
                 }
@@ -439,7 +648,6 @@ def find_list_context(list_element):
     except Exception as e:
         logger.warning(f"Error finding list context: {e}")
         return None
-
 
 def extract_article_content(page):
     """
@@ -713,8 +921,13 @@ async def scrape_all_page(url: str) -> dict:
     try:
         # Use a thread pool executor to run synchronous code
         loop = asyncio.get_event_loop()
-        # Construct ScrapeRequest from url
-        request = ScrapeRequest(url=url)
+        # Construct ScrapeRequest from url with required arguments
+        request = ScrapeRequest(
+            url=url,
+            timeout=30,
+            wait_after_load=2,
+            return_html=False
+        )
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             result = await loop.run_in_executor(executor, sync_scrape, request)
