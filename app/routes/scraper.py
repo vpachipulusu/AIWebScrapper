@@ -6,6 +6,7 @@ from app.services.playwright_service import (
     ScrapeRequest,
     scrape_specific_page_content,
 )
+from app.services.beautifulsoup_service import scrape_with_beautifulsoup
 from app.services.scraper_service import run_scraper
 from app.services.selectolax_service import scrape_page as selectolax_scrape_page
 from urllib.parse import urljoin
@@ -33,6 +34,19 @@ async def selectolax_scrape_endpoint(
 ):
     data = await selectolax_scrape_page(url)
     return data
+
+
+@router.post("/beautifulsoup-scrape")
+async def scrape_with_beautifulsoup_endpoint(request: ScrapeRequest):
+    """
+    Scrape a website using BeautifulSoup with user-selectable content extraction options.
+    More reliable on Windows and for static content.
+    """
+    try:
+        result = await scrape_with_beautifulsoup(request)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/playwright-scrape")
@@ -117,6 +131,82 @@ async def scrape_website_get(
         )
 
         result = await scrape_specific_page_content(request)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/beautifulsoup-scrape")
+async def scrape_with_beautifulsoup_get(
+    url: str,
+    content_types: str = Query(
+        "tables,lists,articles,metadata",
+        description="Comma-separated list of content types to extract",
+    ),
+    custom_selectors: str = Query(None, description="JSON string of custom selectors"),
+    timeout: int = Query(30, description="Timeout in seconds"),
+    wait_after_load: int = Query(2, description="Seconds to wait after page load"),
+    return_html: bool = Query(False, description="Whether to return HTML for analysis"),
+):
+    """
+    Scrape a website using BeautifulSoup with user-selectable content extraction options (GET version).
+    More reliable on Windows and for static content.
+    """
+    try:
+        # Parse content types
+        types_list = [
+            ContentType(t.strip()) for t in content_types.split(",") if t.strip()
+        ]
+
+        # Parse custom selectors if provided
+        custom_selectors_list = []
+        if custom_selectors is not None and custom_selectors.strip():
+            try:
+                import json
+                import ast
+
+                # Clean the input
+                custom_selectors_clean = custom_selectors.strip()
+
+                # Try to parse as JSON first
+                try:
+                    custom_data = json.loads(custom_selectors_clean)
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try to parse as Python literal
+                    try:
+                        custom_data = ast.literal_eval(custom_selectors_clean)
+                    except (ValueError, SyntaxError):
+                        # If both fail, try to manually parse a simple format
+                        custom_data = parse_simple_selector_format(
+                            custom_selectors_clean
+                        )
+
+                # Convert to list of CustomSelector objects
+                if isinstance(custom_data, list):
+                    custom_selectors_list = [CustomSelector(**s) for s in custom_data]
+                elif isinstance(custom_data, dict):
+                    custom_selectors_list = [CustomSelector(**custom_data)]
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="custom_selectors must be a list of objects or a single object",
+                    )
+
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Error parsing custom_selectors: {str(e)}"
+                )
+
+        request = ScrapeRequest(
+            url=url,
+            content_types=types_list,
+            custom_selectors=custom_selectors_list,
+            timeout=timeout,
+            wait_after_load=wait_after_load,
+            return_html=return_html,
+        )
+
+        result = await scrape_with_beautifulsoup(request)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
