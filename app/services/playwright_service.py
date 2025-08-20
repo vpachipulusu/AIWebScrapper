@@ -9,6 +9,7 @@ import subprocess
 import sys
 import re
 from urllib.parse import urljoin
+from typing import Dict, List, Optional, Union
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def install_playwright_browsers():
 def sync_scrape(url: str) -> dict:
     """
     Synchronous scraping function with enhanced error handling
-    Focuses on extracting structured content (tables or articles)
+    Focuses on extracting structured content (tables, articles, or lists)
     """
     # Install browsers first if needed
     try:
@@ -157,9 +158,22 @@ def sync_scrape(url: str) -> dict:
                     "total_rows": sum(len(table["rows"]) for table in tables),
                 }
             else:
-                logger.info("No tables found, extracting article content")
-                content_type = "article"
-                content = extract_article_content(page)
+                # Check if page has lists with data
+                lists = extract_structured_lists(page)
+                if lists and len(lists) > 0:
+                    logger.info(
+                        f"Found {len(lists)} list(s) on page, extracting list data"
+                    )
+                    content_type = "list"
+                    content = {
+                        "lists": lists,
+                        "list_count": len(lists),
+                        "total_items": sum(len(lst["items"]) for lst in lists),
+                    }
+                else:
+                    logger.info("No tables or lists found, extracting article content")
+                    content_type = "article"
+                    content = extract_article_content(page)
 
             # Extract key points and explanations if available
             key_points = extract_key_points(page)
@@ -278,6 +292,102 @@ def extract_structured_tables(page):
     return tables
 
 
+def extract_structured_lists(page):
+    """
+    Extract structured data from lists on the page
+    """
+    lists = []
+
+    try:
+        # Find all lists on the page
+        list_elements = page.query_selector_all("ul, ol")
+
+        for i, list_element in enumerate(list_elements):
+            try:
+                # Skip lists with few items (likely navigation)
+                items = list_element.query_selector_all("li")
+                if len(items) < 3:  # Skip lists with less than 3 items
+                    continue
+
+                # Determine list type
+                list_type = (
+                    "unordered"
+                    if list_element.evaluate("el => el.tagName.toLowerCase()") == "ul"
+                    else "ordered"
+                )
+
+                # Extract list items
+                list_items = []
+                for item in items:
+                    item_text = item.inner_text().strip()
+                    if (
+                        item_text and len(item_text) > 2
+                    ):  # Skip empty or very short items
+                        list_items.append(item_text)
+
+                if list_items:  # Only add lists with items
+                    # Try to find a heading or context for the list
+                    context = find_list_context(list_element)
+
+                    lists.append(
+                        {
+                            "list_index": i,
+                            "type": list_type,
+                            "context": context,
+                            "items": list_items,
+                            "item_count": len(list_items),
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"Error extracting list {i}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error in list extraction: {e}")
+
+    return lists
+
+
+def find_list_context(list_element):
+    """
+    Try to find context or heading for a list
+    """
+    try:
+        # Look for previous sibling that might be a heading
+        previous_element = list_element.evaluate("el => el.previousElementSibling")
+        if previous_element:
+            tag_name = previous_element.evaluate("el => el.tagName.toLowerCase()")
+            if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+                return previous_element.evaluate("el => el.innerText")
+
+            # Check if previous element has a class that suggests it's a heading
+            class_name = previous_element.evaluate("el => el.className || ''")
+            if any(
+                keyword in class_name.lower()
+                for keyword in ["title", "heading", "header", "caption"]
+            ):
+                return previous_element.evaluate("el => el.innerText")
+
+        # Look for parent element that might provide context
+        parent = list_element.evaluate("el => el.parentElement")
+        if parent:
+            # Check if parent has a class that suggests it's a content container
+            class_name = parent.evaluate("el => el.className || ''")
+            if any(
+                keyword in class_name.lower()
+                for keyword in ["content", "section", "article", "block", "box"]
+            ):
+                # Look for a heading within the parent
+                heading = parent.query_selector("h1, h2, h3, h4, h5, h6")
+                if heading:
+                    return heading.inner_text()
+
+        return None
+    except Exception as e:
+        logger.warning(f"Error finding list context: {e}")
+        return None
+
+
 def extract_article_content(page):
     """
     Extract structured article content from the page
@@ -314,7 +424,7 @@ def extract_article_content(page):
 
         # Extract structured content
         sections = []
-        current_section = {"heading": None, "paragraphs": []}
+        current_section = {"heading": None, "paragraphs": [], "lists": []}
 
         # Get all elements within the article
         elements = article_element.query_selector_all("*")
@@ -324,13 +434,18 @@ def extract_article_content(page):
 
             if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
                 # New section found
-                if current_section["paragraphs"] or current_section["heading"]:
+                if (
+                    current_section["paragraphs"]
+                    or current_section["heading"]
+                    or current_section["lists"]
+                ):
                     sections.append(current_section)
 
                 current_section = {
                     "heading": element.inner_text(),
                     "level": int(tag_name[1]),
                     "paragraphs": [],
+                    "lists": [],
                 }
             elif tag_name in ["p", "div"]:
                 # Paragraph content
@@ -345,15 +460,17 @@ def extract_article_content(page):
                 list_items = [item for item in list_items if item and len(item) > 10]
 
                 if list_items:
-                    current_section["paragraphs"].append(
-                        {
-                            "list_type": "ordered" if tag_name == "ol" else "unordered",
-                            "items": list_items,
-                        }
+                    list_type = "ordered" if tag_name == "ol" else "unordered"
+                    current_section["lists"].append(
+                        {"type": list_type, "items": list_items}
                     )
 
         # Add the last section
-        if current_section["paragraphs"] or current_section["heading"]:
+        if (
+            current_section["paragraphs"]
+            or current_section["heading"]
+            or current_section["lists"]
+        ):
             sections.append(current_section)
 
         # Extract full text for completeness
@@ -365,6 +482,7 @@ def extract_article_content(page):
             "text": full_text,
             "section_count": len(sections),
             "paragraph_count": sum(len(section["paragraphs"]) for section in sections),
+            "list_count": sum(len(section["lists"]) for section in sections),
         }
 
     except Exception as e:
