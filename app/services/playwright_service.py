@@ -12,6 +12,11 @@ from urllib.parse import urljoin
 from typing import Dict, List, Optional, Union, Any
 from enum import Enum
 from pydantic import BaseModel, Field
+from .proxy_service import (
+    get_proxy_for_request,
+    report_proxy_success,
+    report_proxy_failure,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -354,6 +359,7 @@ def extract_custom_content(
 
     return custom_content
 
+
 def extract_html_for_analysis(page) -> Dict[str, Any]:
     """
     Extract HTML structure for analysis to help users create selectors
@@ -421,6 +427,7 @@ def extract_html_for_analysis(page) -> Dict[str, Any]:
         logger.error(f"Error extracting HTML for analysis: {e}")
         return {"error": str(e)}
 
+
 def extract_metadata(page, url):
     """
     Extract metadata from the page
@@ -446,6 +453,7 @@ def extract_metadata(page, url):
     except Exception as e:
         logger.error(f"Error extracting metadata: {e}")
         return {"error": str(e)}
+
 
 def extract_structured_tables(page):
     """
@@ -527,6 +535,7 @@ def extract_structured_tables(page):
 
     return tables
 
+
 def extract_structured_lists(page):
     """
     Extract structured data from lists on the page
@@ -579,6 +588,7 @@ def extract_structured_lists(page):
         logger.error(f"Error in list extraction: {e}")
 
     return lists
+
 
 def find_list_context(list_element):
     """
@@ -648,6 +658,7 @@ def find_list_context(list_element):
     except Exception as e:
         logger.warning(f"Error finding list context: {e}")
         return None
+
 
 def extract_article_content(page):
     """
@@ -923,10 +934,7 @@ async def scrape_all_page(url: str) -> dict:
         loop = asyncio.get_event_loop()
         # Construct ScrapeRequest from url with required arguments
         request = ScrapeRequest(
-            url=url,
-            timeout=30,
-            wait_after_load=2,
-            return_html=False
+            url=url, timeout=30, wait_after_load=2, return_html=False
         )
 
         with ThreadPoolExecutor(max_workers=1) as executor:

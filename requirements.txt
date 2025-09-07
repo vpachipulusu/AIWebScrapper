@@ -16,3 +16,4 @@ playwright
 pytest-playwright
 selectolax
 types-requests
+free-proxy

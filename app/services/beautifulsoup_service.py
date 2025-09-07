@@ -11,6 +11,11 @@ import re
 
 # Import models from playwright_service for consistency
 from .playwright_service import ContentType, SelectorType, CustomSelector, ScrapeRequest
+from .proxy_service import (
+    get_proxy_for_request,
+    report_proxy_success,
+    report_proxy_failure,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,22 +49,70 @@ def get_headers() -> Dict[str, str]:
     }
 
 
-def sync_scrape_with_beautifulsoup(request: ScrapeRequest) -> Dict[str, Any]:
+def sync_scrape_with_beautifulsoup(
+    request: ScrapeRequest, use_proxy: bool = True
+) -> Dict[str, Any]:
     """
     Synchronous scraping function using BeautifulSoup with user-selectable content extraction
     """
+    proxy_dict = None
     try:
         logger.info(f"Starting BeautifulSoup scrape for URL: {request.url}")
         logger.info(f"Content types to extract: {request.content_types}")
+
+        # Get proxy if enabled
+        if use_proxy:
+            proxy_dict = get_proxy_for_request()
+            if proxy_dict:
+                logger.info(f"Using proxy: {proxy_dict.get('http', 'unknown')}")
 
         # Make HTTP request with browser-like headers
         session = requests.Session()
         headers = get_headers()
 
-        response = session.get(
-            request.url, headers=headers, timeout=request.timeout, allow_redirects=True
-        )
-        response.raise_for_status()
+        # Attempt request with proxy
+        response = None
+        max_retries = 3 if use_proxy else 1
+
+        for attempt in range(max_retries):
+            try:
+                response = session.get(
+                    request.url,
+                    headers=headers,
+                    proxies=proxy_dict if proxy_dict else None,
+                    timeout=request.timeout,
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+
+                # Report proxy success if used
+                if proxy_dict:
+                    report_proxy_success(proxy_dict)
+                break
+
+            except Exception as e:
+                logger.warning(f"Request attempt {attempt + 1} failed: {e}")
+
+                # Report proxy failure and get a new one
+                if proxy_dict:
+                    report_proxy_failure(proxy_dict)
+                    if attempt < max_retries - 1:  # Don't get new proxy on last attempt
+                        proxy_dict = get_proxy_for_request()
+                        if proxy_dict:
+                            logger.info(
+                                f"Retrying with new proxy: {proxy_dict.get('http', 'unknown')}"
+                            )
+                        else:
+                            logger.warning(
+                                "No more proxies available, trying without proxy"
+                            )
+                            proxy_dict = None
+
+                if attempt == max_retries - 1:
+                    raise e
+
+        if not response:
+            raise Exception("Failed to get response after all retries")
 
         # Parse with BeautifulSoup
         soup = BeautifulSoup(response.content, "html.parser")

@@ -6,10 +6,17 @@ from app.services.playwright_service import (
     ScrapeRequest,
     scrape_specific_page_content,
 )
-from app.services.beautifulsoup_service import scrape_with_beautifulsoup
+from app.services.beautifulsoup_service import sync_scrape_with_beautifulsoup
 from app.services.scraper_service import run_scraper
 from app.services.selectolax_service import scrape_page as selectolax_scrape_page
+from app.services.proxy_service import (
+    refresh_proxies,
+    get_proxy_statistics,
+    get_proxy_for_request,
+)
 from urllib.parse import urljoin
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 router = APIRouter()
 
@@ -37,13 +44,21 @@ async def selectolax_scrape_endpoint(
 
 
 @router.post("/beautifulsoup-scrape")
-async def scrape_with_beautifulsoup_endpoint(request: ScrapeRequest):
+async def scrape_with_beautifulsoup_endpoint(
+    request: ScrapeRequest,
+    use_proxy: bool = Query(True, description="Whether to use proxy rotation"),
+):
     """
     Scrape a website using BeautifulSoup with user-selectable content extraction options.
-    More reliable on Windows and for static content.
+    More reliable on Windows and for static content. Includes proxy support.
     """
     try:
-        result = await scrape_with_beautifulsoup(request)
+        # Run in thread pool since sync_scrape_with_beautifulsoup is synchronous
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            result = await loop.run_in_executor(
+                executor, sync_scrape_with_beautifulsoup, request, use_proxy
+            )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -147,6 +162,7 @@ async def scrape_with_beautifulsoup_get(
     timeout: int = Query(30, description="Timeout in seconds"),
     wait_after_load: int = Query(2, description="Seconds to wait after page load"),
     return_html: bool = Query(False, description="Whether to return HTML for analysis"),
+    use_proxy: bool = Query(True, description="Whether to use proxy rotation"),
 ):
     """
     Scrape a website using BeautifulSoup with user-selectable content extraction options (GET version).
@@ -206,7 +222,12 @@ async def scrape_with_beautifulsoup_get(
             return_html=return_html,
         )
 
-        result = await scrape_with_beautifulsoup(request)
+        # Run in thread pool since sync_scrape_with_beautifulsoup is synchronous
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            result = await loop.run_in_executor(
+                executor, sync_scrape_with_beautifulsoup, request, use_proxy
+            )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -232,3 +253,42 @@ def parse_simple_selector_format(selector_str: str):
             selectors.append(selector_obj)
 
     return selectors
+
+
+# Proxy management endpoints
+@router.get("/proxy/stats")
+async def get_proxy_stats():
+    """Get current proxy pool statistics."""
+    try:
+        stats = get_proxy_statistics()
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/proxy/refresh")
+async def refresh_proxy_pool(
+    force: bool = Query(False, description="Force refresh even if recently refreshed"),
+):
+    """Refresh the proxy pool with new working proxies."""
+    try:
+        # Run refresh in thread pool since it's synchronous
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            await loop.run_in_executor(executor, refresh_proxies, force)
+        return {"message": "Proxy pool refresh initiated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/proxy/current")
+async def get_current_proxy():
+    """Get a proxy from the current pool for testing."""
+    try:
+        proxy = get_proxy_for_request()
+        if proxy:
+            return {"proxy": proxy}
+        else:
+            return {"proxy": None, "message": "No working proxies available"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
