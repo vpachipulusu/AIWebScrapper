@@ -15,3 +15,4 @@ lxml
 playwright
 pytest-playwright
 selectolax
+types-requests

@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import traceback
 import requests
-from bs4 import BeautifulSoup, Comment
+from bs4 import BeautifulSoup, Comment, Tag
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List, Optional, Any
 import re
@@ -24,7 +24,7 @@ USER_AGENTS = [
 ]
 
 
-def get_headers():
+def get_headers() -> Dict[str, str]:
     """Generate browser-like headers"""
     import random
 
@@ -44,7 +44,7 @@ def get_headers():
     }
 
 
-def sync_scrape_with_beautifulsoup(request: ScrapeRequest) -> dict:
+def sync_scrape_with_beautifulsoup(request: ScrapeRequest) -> Dict[str, Any]:
     """
     Synchronous scraping function using BeautifulSoup with user-selectable content extraction
     """
@@ -73,7 +73,7 @@ def sync_scrape_with_beautifulsoup(request: ScrapeRequest) -> dict:
             comment.extract()
 
         # Initialize result dictionary
-        result = {}
+        result: Dict[str, Any] = {}
 
         # Extract metadata if requested
         if ContentType.METADATA in request.content_types:
@@ -83,28 +83,28 @@ def sync_scrape_with_beautifulsoup(request: ScrapeRequest) -> dict:
         # Extract tables if requested
         if ContentType.TABLES in request.content_types:
             logger.info("Extracting tables...")
-            tables = extract_structured_tables_bs(soup)
+            tables: Optional[List[Dict[str, Any]]] = extract_structured_tables_bs(soup)
             if tables:
                 result["tables"] = tables
 
         # Extract lists if requested
         if ContentType.LISTS in request.content_types:
             logger.info("Extracting lists...")
-            lists = extract_structured_lists_bs(soup)
+            lists: Optional[List[Dict[str, Any]]] = extract_structured_lists_bs(soup)
             if lists:
                 result["lists"] = lists
 
         # Extract articles if requested
         if ContentType.ARTICLES in request.content_types:
             logger.info("Extracting articles...")
-            article = extract_article_content_bs(soup)
+            article: Optional[Dict[str, Any]] = extract_article_content_bs(soup)
             if article and (article.get("sections") or article.get("text")):
                 result["article"] = article
 
         # Extract key points if requested
         if ContentType.KEY_POINTS in request.content_types:
             logger.info("Extracting key points...")
-            key_points = extract_key_points_bs(soup)
+            key_points: Optional[List[str]] = extract_key_points_bs(soup)
             if key_points:
                 result["key_points"] = key_points
 
@@ -144,18 +144,20 @@ def sync_scrape_with_beautifulsoup(request: ScrapeRequest) -> dict:
         raise Exception(error_msg)
 
 
-def extract_metadata_bs(soup: BeautifulSoup, url: str) -> dict:
+def extract_metadata_bs(soup: BeautifulSoup, url: str) -> Dict[str, Any]:
     """Extract metadata from the page using BeautifulSoup"""
     try:
         # Extract title
         title_tag = soup.find("title")
-        title = title_tag.get_text().strip() if title_tag else "No title found"
+        title: str = title_tag.get_text().strip() if title_tag else "No title found"
 
         # Extract description
-        description = None
+        description: Optional[str] = None
         desc_tag = soup.find("meta", attrs={"name": "description"})
-        if desc_tag and desc_tag.get("content"):
-            description = desc_tag["content"].strip()
+        if desc_tag and isinstance(desc_tag, Tag) and desc_tag.get("content"):
+            content_value = desc_tag.get("content")
+            if isinstance(content_value, str):
+                description = content_value.strip()
 
         return {
             "url": url,
@@ -167,55 +169,78 @@ def extract_metadata_bs(soup: BeautifulSoup, url: str) -> dict:
         return {"error": str(e)}
 
 
-def extract_structured_tables_bs(soup: BeautifulSoup) -> List[dict]:
+def extract_structured_tables_bs(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     """Extract structured data from tables using BeautifulSoup"""
-    tables = []
+    tables: List[Dict[str, Any]] = []
 
     try:
         table_elements = soup.find_all("table")
 
         for i, table in enumerate(table_elements):
             try:
+                if not isinstance(table, Tag):
+                    continue
+
                 rows = table.find_all("tr")
                 if len(rows) < 2:  # Skip tables with less than 2 rows
                     continue
 
                 # Extract caption if available
                 caption_tag = table.find("caption")
-                caption = caption_tag.get_text().strip() if caption_tag else None
+                caption: Optional[str] = (
+                    caption_tag.get_text().strip() if caption_tag else None
+                )
 
                 # Extract headers
-                headers = []
-                header_row = table.find("thead")
-                if header_row:
-                    header_row = header_row.find("tr")
+                headers: List[str] = []
+                header_row_element = table.find("thead")
+                header_row = None
+                if header_row_element and isinstance(header_row_element, Tag):
+                    header_row = header_row_element.find("tr")
                 else:
-                    header_row = rows[0]
+                    header_row = rows[0] if rows else None
 
-                header_cells = header_row.find_all(["th", "td"])
-                for cell in header_cells:
-                    headers.append(
-                        cell.get_text().strip() or f"Column {len(headers) + 1}"
-                    )
+                if header_row and isinstance(header_row, Tag):
+                    header_cells = header_row.find_all(["th", "td"])
+                    for cell in header_cells:
+                        headers.append(
+                            cell.get_text().strip() or f"Column {len(headers) + 1}"
+                        )
 
                 # Extract rows
-                table_rows = []
+                table_rows: List[List[Dict[str, Any]]] = []
                 tbody = table.find("tbody")
-                body_rows = tbody.find_all("tr") if tbody else rows
+                if tbody and isinstance(tbody, Tag):
+                    body_rows = tbody.find_all("tr")
+                else:
+                    body_rows = rows
 
                 # Skip header row if it was in the body
                 start_idx = 1 if not table.find("thead") and header_row in rows else 0
 
                 for row in body_rows[start_idx:]:
-                    row_data = []
+                    if not isinstance(row, Tag):
+                        continue
+
+                    row_data: List[Dict[str, Any]] = []
                     cells = row.find_all(["td", "th"])
 
                     for cell in cells:
-                        # Check for rowspan and colspan
-                        rowspan = int(cell.get("rowspan", 1))
-                        colspan = int(cell.get("colspan", 1))
+                        if not isinstance(cell, Tag):
+                            continue
 
-                        cell_text = cell.get_text().strip()
+                        # Check for rowspan and colspan
+                        rowspan_attr = cell.get("rowspan", "1")
+                        colspan_attr = cell.get("colspan", "1")
+
+                        rowspan: int = (
+                            int(rowspan_attr) if isinstance(rowspan_attr, str) else 1
+                        )
+                        colspan: int = (
+                            int(colspan_attr) if isinstance(colspan_attr, str) else 1
+                        )
+
+                        cell_text: str = cell.get_text().strip()
                         row_data.append(
                             {"value": cell_text, "rowspan": rowspan, "colspan": colspan}
                         )
@@ -243,15 +268,18 @@ def extract_structured_tables_bs(soup: BeautifulSoup) -> List[dict]:
     return tables
 
 
-def extract_structured_lists_bs(soup: BeautifulSoup) -> List[dict]:
+def extract_structured_lists_bs(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     """Extract structured data from lists using BeautifulSoup"""
-    lists = []
+    lists: List[Dict[str, Any]] = []
 
     try:
         list_elements = soup.find_all(["ul", "ol"])
 
         for i, list_element in enumerate(list_elements):
             try:
+                if not isinstance(list_element, Tag):
+                    continue
+
                 items = list_element.find_all(
                     "li", recursive=False
                 )  # Direct children only
@@ -259,12 +287,12 @@ def extract_structured_lists_bs(soup: BeautifulSoup) -> List[dict]:
                     continue
 
                 # Determine list type
-                list_type = "ordered" if list_element.name == "ol" else "unordered"
+                list_type: str = "ordered" if list_element.name == "ol" else "unordered"
 
                 # Extract list items
-                list_items = []
+                list_items: List[str] = []
                 for item in items:
-                    item_text = item.get_text().strip()
+                    item_text: str = item.get_text().strip()
                     if (
                         item_text and len(item_text) > 2
                     ):  # Skip empty or very short items
@@ -272,7 +300,7 @@ def extract_structured_lists_bs(soup: BeautifulSoup) -> List[dict]:
 
                 if list_items:  # Only add lists with items
                     # Try to find context for the list
-                    context = find_list_context_bs(list_element)
+                    context: Optional[str] = find_list_context_bs(list_element)
 
                     lists.append(
                         {
@@ -293,19 +321,26 @@ def extract_structured_lists_bs(soup: BeautifulSoup) -> List[dict]:
     return lists
 
 
-def find_list_context_bs(list_element) -> Optional[str]:
+def find_list_context_bs(list_element: Tag) -> Optional[str]:
     """Try to find context or heading for a list using BeautifulSoup"""
     try:
         # Look for previous sibling that might be a heading
         previous = list_element.find_previous_sibling()
-        if previous and previous.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+        if (
+            previous
+            and hasattr(previous, "name")
+            and previous.name in ["h1", "h2", "h3", "h4", "h5", "h6"]
+        ):
             return previous.get_text().strip()
 
         # Look for parent element that might provide context
         parent = list_element.parent
-        if parent:
+        if parent and isinstance(parent, Tag):
             # Check if parent has a class that suggests it's a content container
-            parent_classes = parent.get("class", [])
+            parent_classes_attr = parent.get("class")
+            parent_classes: List[str] = (
+                parent_classes_attr if isinstance(parent_classes_attr, list) else []
+            )
             if any(
                 cls in ["content", "section", "article", "block", "box"]
                 for cls in parent_classes
@@ -321,11 +356,11 @@ def find_list_context_bs(list_element) -> Optional[str]:
         return None
 
 
-def extract_article_content_bs(soup: BeautifulSoup) -> dict:
+def extract_article_content_bs(soup: BeautifulSoup) -> Dict[str, Any]:
     """Extract structured article content using BeautifulSoup"""
     try:
         # Try to find article using common selectors
-        article_selectors = [
+        article_selectors: List[str] = [
             "article",
             "main",
             '[role="main"]',
@@ -339,28 +374,38 @@ def extract_article_content_bs(soup: BeautifulSoup) -> dict:
             "#article",
         ]
 
-        article_element = None
+        article_element: Optional[Tag] = None
         for selector in article_selectors:
-            article_element = soup.select_one(selector)
-            if article_element:
+            found_element = soup.select_one(selector)
+            if found_element and isinstance(found_element, Tag):
+                article_element = found_element
                 break
 
         # If no article found, use body
         if not article_element:
-            article_element = soup.find("body")
+            body_element = soup.find("body")
+            if body_element and isinstance(body_element, Tag):
+                article_element = body_element
 
         if not article_element:
             return {"sections": [], "text": ""}
 
         # Extract structured content
-        sections = []
-        current_section = {"heading": None, "paragraphs": [], "lists": []}
+        sections: List[Dict[str, Any]] = []
+        current_section: Dict[str, Any] = {
+            "heading": None,
+            "paragraphs": [],
+            "lists": [],
+        }
 
         # Get all elements within the article
         elements = article_element.find_all(True)
 
         for element in elements:
-            tag_name = element.name.lower()
+            if not isinstance(element, Tag) or not hasattr(element, "name"):
+                continue
+
+            tag_name: str = element.name.lower()
 
             if tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
                 # New section found
@@ -379,16 +424,18 @@ def extract_article_content_bs(soup: BeautifulSoup) -> dict:
                 }
             elif tag_name in ["p", "div"]:
                 # Paragraph content
-                text = element.get_text().strip()
+                text: str = element.get_text().strip()
                 if text and len(text) > 30 and not is_noisy_text_bs(text):
                     current_section["paragraphs"].append(text)
             elif tag_name in ["ul", "ol"]:
                 # List content
-                list_items = [li.get_text().strip() for li in element.find_all("li")]
+                list_items: List[str] = [
+                    li.get_text().strip() for li in element.find_all("li")
+                ]
                 list_items = [item for item in list_items if item and len(item) > 10]
 
                 if list_items:
-                    list_type = "ordered" if tag_name == "ol" else "unordered"
+                    list_type: str = "ordered" if tag_name == "ol" else "unordered"
                     current_section["lists"].append(
                         {"type": list_type, "items": list_items}
                     )
@@ -420,11 +467,11 @@ def extract_article_content_bs(soup: BeautifulSoup) -> dict:
 
 def extract_key_points_bs(soup: BeautifulSoup) -> List[str]:
     """Extract key points or important information using BeautifulSoup"""
-    key_points = []
+    key_points: List[str] = []
 
     try:
         # Look for key points using common selectors
-        key_point_selectors = [
+        key_point_selectors: List[str] = [
             ".key-point",
             ".important",
             ".highlight",
@@ -454,11 +501,11 @@ def extract_key_points_bs(soup: BeautifulSoup) -> List[str]:
 
 def extract_explanations_bs(soup: BeautifulSoup) -> List[str]:
     """Extract explanations or descriptive text using BeautifulSoup"""
-    explanations = []
+    explanations: List[str] = []
 
     try:
         # Look for explanations using common selectors
-        explanation_selectors = [
+        explanation_selectors: List[str] = [
             ".explanation",
             ".description",
             ".instruction",
@@ -470,7 +517,7 @@ def extract_explanations_bs(soup: BeautifulSoup) -> List[str]:
         for selector in explanation_selectors:
             elements = soup.select(selector)
             for element in elements:
-                text = element.get_text().strip()
+                text: str = element.get_text().strip()
                 if text and len(text) > 20 and not is_noisy_text_bs(text):
                     explanations.append(text)
 
@@ -480,17 +527,26 @@ def extract_explanations_bs(soup: BeautifulSoup) -> List[str]:
     return explanations
 
 
-def extract_structured_links_bs(soup: BeautifulSoup, base_url: str) -> List[dict]:
+def extract_structured_links_bs(
+    soup: BeautifulSoup, base_url: str
+) -> List[Dict[str, Any]]:
     """Extract structured link information using BeautifulSoup"""
-    links = []
+    links: List[Dict[str, Any]] = []
 
     try:
         link_elements = soup.find_all("a", href=True)
 
         for link in link_elements:
             try:
-                href = link["href"]
-                text = link.get_text().strip()
+                if not isinstance(link, Tag):
+                    continue
+
+                href_attr = link.get("href")
+                if not href_attr or not isinstance(href_attr, str):
+                    continue
+
+                href: str = href_attr
+                text: str = link.get_text().strip()
 
                 # Skip navigation and noisy links
                 if not text or is_noisy_text_bs(text):
@@ -531,14 +587,15 @@ def extract_custom_content_bs(
     soup: BeautifulSoup, custom_selectors: List[CustomSelector]
 ) -> Dict[str, Any]:
     """Extract content using custom CSS selectors using BeautifulSoup"""
-    custom_content = {}
+    custom_content: Dict[str, Any] = {}
 
     for selector_def in custom_selectors:
         try:
-            elements = []
+            elements: List[Tag] = []
 
             if selector_def.selector_type == SelectorType.CSS:
-                elements = soup.select(selector_def.selector)
+                found_elements = soup.select(selector_def.selector)
+                elements = [elem for elem in found_elements if isinstance(elem, Tag)]
             elif selector_def.selector_type == SelectorType.XPATH:
                 # BeautifulSoup doesn't support XPath directly, skip or convert to CSS
                 logger.warning(
@@ -550,27 +607,30 @@ def extract_custom_content_bs(
                 continue
 
             if not elements:
-                custom_content[selector_def.name] = None
+                custom_content[selector_def.name] = []
                 continue
 
-            extracted_data = []
+            extracted_data: List[Any] = []
 
             for element in elements:
                 try:
                     if selector_def.extract == "text":
-                        text = element.get_text().strip()
+                        text: str = element.get_text().strip()
                         extracted_data.append(text)
                     elif selector_def.extract == "html":
-                        html_content = str(element)
+                        html_content: str = str(element)
                         extracted_data.append(html_content)
                     elif selector_def.extract == "attribute" and selector_def.attribute:
                         attr_value = element.get(selector_def.attribute, "")
-                        extracted_data.append(attr_value)
+                        if isinstance(attr_value, str):
+                            extracted_data.append(attr_value)
                     elif selector_def.extract == "all":
                         # Extract both text and HTML
-                        text = element.get_text().strip()
-                        html_content = str(element)
-                        extracted_data.append({"text": text, "html": html_content})
+                        element_text: str = element.get_text().strip()
+                        element_html: str = str(element)
+                        extracted_data.append(
+                            {"text": element_text, "html": element_html}
+                        )
                     else:
                         # Default to text
                         text = element.get_text().strip()
@@ -601,22 +661,28 @@ def extract_html_for_analysis_bs(soup: BeautifulSoup) -> Dict[str, Any]:
     try:
         # Get the main content areas
         body = soup.find("body")
-        body_html = str(body) if body else str(soup)
+        body_html: str = str(body) if body else str(soup)
 
         # Find all unique CSS classes and IDs for analysis
         all_elements = soup.find_all(True)
-        classes = set()
-        ids = set()
+        classes: set = set()
+        ids: set = set()
 
         for element in all_elements:
-            element_classes = element.get("class", [])
-            for cls in element_classes:
-                if cls:
-                    classes.add(cls)
+            if isinstance(element, Tag):
+                element_classes_attr = element.get("class")
+                element_classes: List[str] = (
+                    element_classes_attr
+                    if isinstance(element_classes_attr, list)
+                    else []
+                )
+                for cls in element_classes:
+                    if cls:
+                        classes.add(cls)
 
-            element_id = element.get("id")
-            if element_id:
-                ids.add(element_id)
+                element_id = element.get("id")
+                if element_id and isinstance(element_id, str):
+                    ids.add(element_id)
 
         # Get common content containers
         content_containers = {
