@@ -268,10 +268,10 @@ def sync_scrape(request: ScrapeRequest) -> dict:
                 result["html"] = extract_html_for_analysis(page)
 
             logger.info("Scraping completed successfully")
-            
+
             # Convert NumPy types to native Python types for JSON serialization
             result = convert_numpy_types(result)
-            
+
             return result
 
     except Exception as e:

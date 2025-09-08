@@ -308,7 +308,7 @@ async def scrape_with_beautifulsoup_pandas(
     try:
         # Get basic scraped data using BeautifulSoup with pandas
         from app.services.scraper_service import run_scraper_with_pandas
-        
+
         enhanced_data = run_scraper_with_pandas(str(request.url))
 
         return {
