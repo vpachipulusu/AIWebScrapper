@@ -7,13 +7,14 @@ from app.services.playwright_service import (
     scrape_specific_page_content,
 )
 from app.services.beautifulsoup_service import sync_scrape_with_beautifulsoup
-from app.services.scraper_service import run_scraper
+from app.services.scraper_service import run_scraper, run_scraper_with_pandas
 from app.services.selectolax_service import scrape_page as selectolax_scrape_page
 from app.services.proxy_service import (
     refresh_proxies,
     get_proxy_statistics,
     get_proxy_for_request,
 )
+from app.services.data_processor import process_web_data
 from urllib.parse import urljoin
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -292,3 +293,237 @@ async def get_current_proxy():
             return {"proxy": None, "message": "No working proxies available"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Pandas-enhanced scraping endpoints
+@router.post("/beautifulsoup-pandas")
+async def scrape_with_beautifulsoup_pandas(
+    request: ScrapeRequest,
+    use_proxy: bool = Query(True, description="Whether to use proxy rotation"),
+):
+    """
+    Enhanced BeautifulSoup scraping with comprehensive pandas data processing,
+    cleaning, and analysis.
+    """
+    try:
+        # Get basic scraped data using BeautifulSoup with pandas
+        from app.services.scraper_service import run_scraper_with_pandas
+        
+        enhanced_data = run_scraper_with_pandas(str(request.url))
+
+        return {
+            "status": "success",
+            "enhanced_with_pandas": True,
+            "data": enhanced_data,
+            "features": [
+                "Table extraction and cleaning",
+                "List analysis and patterns",
+                "Text readability analysis",
+                "Data quality assessment",
+                "Export-ready formats",
+                "Statistical insights",
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Enhanced scraping failed: {str(e)}"
+        )
+
+
+@router.post("/playwright-pandas")
+async def scrape_with_playwright_pandas(
+    url: HttpUrl,
+    content_types: str = Query(
+        "tables,lists,articles", description="Comma-separated content types to extract"
+    ),
+    timeout: int = Query(30, description="Timeout in seconds"),
+    wait_after_load: int = Query(2, description="Seconds to wait after page load"),
+    use_proxy: bool = Query(True, description="Whether to use proxy rotation"),
+):
+    """
+    Enhanced Playwright scraping with comprehensive pandas data processing.
+    Extracts structured data and provides advanced analysis.
+    """
+    try:
+        # Parse content types
+        types_list = [
+            ContentType(t.strip()) for t in content_types.split(",") if t.strip()
+        ]
+
+        # Create request object
+        request = ScrapeRequest(
+            url=url,
+            content_types=types_list,
+            timeout=timeout,
+            wait_after_load=wait_after_load,
+        )
+
+        # Get data using Playwright
+        playwright_data = await scrape_specific_page_content(request)
+
+        # Process with pandas for enhanced analysis
+        enhanced_data = process_web_data(playwright_data, str(url))
+
+        return {
+            "status": "success",
+            "enhanced_with_pandas": True,
+            "extraction_method": "playwright",
+            "data": enhanced_data,
+            "features": [
+                "Advanced table processing with statistics",
+                "List pattern detection and classification",
+                "Content structure analysis",
+                "Data quality metrics",
+                "Multiple export formats",
+                "Comprehensive insights",
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Enhanced Playwright scraping failed: {str(e)}"
+        )
+
+
+@router.post("/comprehensive-analysis")
+async def comprehensive_data_analysis(
+    url: HttpUrl,
+    include_beautifulsoup: bool = Query(
+        True, description="Include BeautifulSoup extraction"
+    ),
+    include_playwright: bool = Query(True, description="Include Playwright extraction"),
+    use_proxy: bool = Query(True, description="Whether to use proxy rotation"),
+):
+    """
+    Comprehensive web data analysis using both BeautifulSoup and Playwright
+    with advanced pandas processing for maximum data extraction and insights.
+    """
+    try:
+        results = {
+            "url": str(url),
+            "analysis_timestamp": None,
+            "extraction_methods": [],
+            "combined_insights": {},
+            "data_sources": {},
+        }
+
+        # BeautifulSoup extraction
+        if include_beautifulsoup:
+            try:
+                bs_data = await sync_scrape_with_beautifulsoup(str(url), use_proxy)
+                bs_enhanced = process_web_data(bs_data, str(url))
+                results["data_sources"]["beautifulsoup"] = bs_enhanced
+                results["extraction_methods"].append("beautifulsoup")
+            except Exception as e:
+                results["data_sources"]["beautifulsoup"] = {"error": str(e)}
+
+        # Playwright extraction
+        if include_playwright:
+            try:
+                request = ScrapeRequest(
+                    url=url,
+                    content_types=[
+                        ContentType.TABLES,
+                        ContentType.LISTS,
+                        ContentType.ARTICLES,
+                    ],
+                    timeout=30,
+                    wait_after_load=2,
+                )
+                pw_data = await scrape_specific_page_content(request)
+                pw_enhanced = process_web_data(pw_data, str(url))
+                results["data_sources"]["playwright"] = pw_enhanced
+                results["extraction_methods"].append("playwright")
+            except Exception as e:
+                results["data_sources"]["playwright"] = {"error": str(e)}
+
+        # Generate combined insights
+        results["combined_insights"] = generate_combined_insights(
+            results["data_sources"]
+        )
+        results["analysis_timestamp"] = (
+            results["data_sources"]
+            .get("beautifulsoup", results["data_sources"].get("playwright", {}))
+            .get("processed_at")
+        )
+
+        return {
+            "status": "success",
+            "comprehensive_analysis": True,
+            "data": results,
+            "summary": {
+                "total_extraction_methods": len(results["extraction_methods"]),
+                "successful_extractions": len(
+                    [
+                        m
+                        for m in results["extraction_methods"]
+                        if "error" not in results["data_sources"].get(m, {})
+                    ]
+                ),
+                "features": [
+                    "Multi-method extraction comparison",
+                    "Cross-validation of extracted data",
+                    "Comprehensive data quality analysis",
+                    "Combined statistical insights",
+                    "Method-specific strengths identification",
+                ],
+            },
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Comprehensive analysis failed: {str(e)}"
+        )
+
+
+def generate_combined_insights(data_sources):
+    """Generate insights by comparing data from multiple extraction methods."""
+    insights = {"data_consistency": {}, "method_comparison": {}, "recommendations": []}
+
+    # Compare table extraction
+    bs_tables = len(
+        data_sources.get("beautifulsoup", {}).get("enhanced_data", {}).get("tables", [])
+    )
+    pw_tables = len(
+        data_sources.get("playwright", {}).get("enhanced_data", {}).get("tables", [])
+    )
+
+    insights["method_comparison"]["tables_found"] = {
+        "beautifulsoup": bs_tables,
+        "playwright": pw_tables,
+        "consistency": "high" if abs(bs_tables - pw_tables) <= 1 else "low",
+    }
+
+    # Compare list extraction
+    bs_lists = len(
+        data_sources.get("beautifulsoup", {}).get("enhanced_data", {}).get("lists", [])
+    )
+    pw_lists = len(
+        data_sources.get("playwright", {}).get("enhanced_data", {}).get("lists", [])
+    )
+
+    insights["method_comparison"]["lists_found"] = {
+        "beautifulsoup": bs_lists,
+        "playwright": pw_lists,
+        "consistency": "high" if abs(bs_lists - pw_lists) <= 2 else "low",
+    }
+
+    # Generate recommendations
+    if pw_tables > bs_tables:
+        insights["recommendations"].append(
+            "Playwright found more tables - prefer for table extraction"
+        )
+    elif bs_tables > pw_tables:
+        insights["recommendations"].append(
+            "BeautifulSoup found more tables - prefer for table extraction"
+        )
+
+    if pw_lists > bs_lists:
+        insights["recommendations"].append(
+            "Playwright found more lists - prefer for list extraction"
+        )
+    elif bs_lists > pw_lists:
+        insights["recommendations"].append(
+            "BeautifulSoup found more lists - prefer for list extraction"
+        )
+
+    return insights

@@ -12,6 +12,10 @@ from urllib.parse import urljoin
 from typing import Dict, List, Optional, Union, Any
 from enum import Enum
 from pydantic import BaseModel, Field
+import pandas as pd
+import numpy as np
+import json
+from .data_processor import convert_numpy_types
 from .proxy_service import (
     get_proxy_for_request,
     report_proxy_success,
@@ -264,6 +268,10 @@ def sync_scrape(request: ScrapeRequest) -> dict:
                 result["html"] = extract_html_for_analysis(page)
 
             logger.info("Scraping completed successfully")
+            
+            # Convert NumPy types to native Python types for JSON serialization
+            result = convert_numpy_types(result)
+            
             return result
 
     except Exception as e:
@@ -300,8 +308,9 @@ def extract_custom_content(
                 # For XPath, we need to use a different approach
                 try:
                     elements = page.query_selector_all(f"xpath={selector_def.selector}")
-                except:
+                except Exception as e:
                     # Fallback to evaluate for complex XPath expressions
+                    logger.warning(f"XPath selector failed, using fallback: {e}")
                     elements = page.evaluate(f"""() => {{
                         const results = [];
                         const nodes = document.evaluate('{selector_def.selector}', document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
@@ -457,7 +466,7 @@ def extract_metadata(page, url):
 
 def extract_structured_tables(page):
     """
-    Extract structured data from tables on the page
+    Extract structured data from tables on the page with pandas processing
     """
     tables = []
 
@@ -486,8 +495,8 @@ def extract_structured_tables(page):
                         cell.inner_text().strip() or f"Column {len(headers) + 1}"
                     )
 
-                # Extract rows
-                table_rows = []
+                # Extract rows data for pandas DataFrame
+                table_data = []
                 body_rows = (
                     table.query_selector_all("tbody tr")
                     if table.query_selector("tbody")
@@ -504,28 +513,70 @@ def extract_structured_tables(page):
                     cells = row.query_selector_all("td, th")
 
                     for cell in cells:
-                        # Check for rowspan and colspan
-                        rowspan = int(cell.get_attribute("rowspan") or 1)
-                        colspan = int(cell.get_attribute("colspan") or 1)
-
                         cell_text = cell.inner_text().strip()
-                        row_data.append(
-                            {"value": cell_text, "rowspan": rowspan, "colspan": colspan}
+                        row_data.append(cell_text)
+
+                    # Pad row to match header length
+                    while len(row_data) < len(headers):
+                        row_data.append("")
+
+                    # Truncate if too long
+                    row_data = row_data[: len(headers)]
+
+                    if any(row_data):  # Only add non-empty rows
+                        table_data.append(row_data)
+
+                if table_data:  # Only process tables with data
+                    # Create pandas DataFrame
+                    try:
+                        df = pd.DataFrame(table_data, columns=headers)
+
+                        # Clean the DataFrame
+                        df = clean_playwright_dataframe(df)
+
+                        # Generate statistics
+                        df_stats = generate_dataframe_stats(df)
+
+                        tables.append(
+                            {
+                                "table_index": i,
+                                "caption": caption,
+                                "headers": headers,
+                                "dataframe": df.to_dict("records"),
+                                "shape": df.shape,
+                                "statistics": df_stats,
+                                "pandas_summary": {
+                                    "dtypes": df.dtypes.to_dict(),
+                                    "null_counts": df.isnull().sum().to_dict(),
+                                    "description": df.describe(include="all").to_dict()
+                                    if not df.empty
+                                    else {},
+                                },
+                                "summary": f"Table with {len(headers)} columns and {len(table_data)} rows",
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error processing table {i} with pandas: {e}")
+                        # Fallback to original format
+                        table_rows = []
+                        for row_data in table_data:
+                            row_cells = []
+                            for cell_text in row_data:
+                                row_cells.append(
+                                    {"value": cell_text, "rowspan": 1, "colspan": 1}
+                                )
+                            table_rows.append(row_cells)
+
+                        tables.append(
+                            {
+                                "table_index": i,
+                                "caption": caption,
+                                "headers": headers,
+                                "rows": table_rows,
+                                "summary": f"Table with {len(headers)} columns and {len(table_data)} rows",
+                            }
                         )
 
-                    if row_data:
-                        table_rows.append(row_data)
-
-                if table_rows:  # Only add tables with data
-                    tables.append(
-                        {
-                            "table_index": i,
-                            "caption": caption,
-                            "headers": headers,
-                            "rows": table_rows,
-                            "summary": f"Table with {len(headers)} columns and {len(table_rows)} rows",
-                        }
-                    )
             except Exception as e:
                 logger.warning(f"Error extracting table {i}: {e}")
                 continue
@@ -536,9 +587,90 @@ def extract_structured_tables(page):
     return tables
 
 
+def clean_playwright_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean and format a pandas DataFrame from Playwright extraction."""
+    # Remove completely empty rows and columns
+    df = df.dropna(how="all").dropna(axis=1, how="all")
+
+    # Strip whitespace from string columns
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].astype(str).str.strip()
+            df[col] = df[col].replace(["", "None", "nan", "NaN"], np.nan)
+
+    # Try to convert numeric columns
+    for col in df.columns:
+        if df[col].dtype == "object":
+            # Try to convert to numeric
+            numeric_series = pd.to_numeric(df[col], errors="coerce")
+            if numeric_series.notna().sum() > len(df) * 0.6:  # If 60% can be converted
+                df[col] = numeric_series
+            else:
+                # Try to convert to datetime
+                try:
+                    datetime_series = pd.to_datetime(
+                        df[col], errors="coerce", infer_datetime_format=True
+                    )
+                    if datetime_series.notna().sum() > len(df) * 0.6:
+                        df[col] = datetime_series
+                except Exception:
+                    pass
+
+    # Reset index
+    df = df.reset_index(drop=True)
+
+    return df
+
+
+def generate_dataframe_stats(df: pd.DataFrame) -> Dict[str, Any]:
+    """Generate comprehensive statistics for a DataFrame."""
+    if df.empty:
+        return {}
+
+    stats = {
+        "shape": df.shape,
+        "memory_usage": df.memory_usage(deep=True).sum(),
+        "column_types": df.dtypes.to_dict(),
+    }
+
+    # Numeric columns analysis
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        stats["numeric_summary"] = df[numeric_cols].describe().to_dict()
+        stats["correlations"] = (
+            df[numeric_cols].corr().to_dict() if len(numeric_cols) > 1 else {}
+        )
+
+    # Text columns analysis
+    text_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    if text_cols:
+        stats["text_summary"] = {}
+        for col in text_cols:
+            valid_values = df[col].dropna()
+            if not valid_values.empty:
+                stats["text_summary"][col] = {
+                    "unique_count": valid_values.nunique(),
+                    "top_values": valid_values.value_counts().head(5).to_dict(),
+                    "avg_length": valid_values.astype(str).str.len().mean(),
+                    "max_length": valid_values.astype(str).str.len().max(),
+                }
+
+    # Missing data analysis
+    stats["missing_data"] = {
+        "total_missing": df.isnull().sum().sum(),
+        "missing_by_column": df.isnull().sum().to_dict(),
+        "missing_percentage": (df.isnull().sum() / len(df) * 100).to_dict(),
+    }
+
+    # Convert NumPy types to native Python types for JSON serialization
+    stats = convert_numpy_types(stats)
+
+    return stats
+
+
 def extract_structured_lists(page):
     """
-    Extract structured data from lists on the page
+    Extract structured data from lists on the page with pandas processing
     """
     lists = []
 
@@ -571,15 +703,93 @@ def extract_structured_lists(page):
                     # Try to find a heading or context for the list
                     context = find_list_context(list_element)
 
-                    lists.append(
-                        {
-                            "list_index": i,
-                            "type": list_type,
-                            "context": context,
-                            "items": list_items,
-                            "item_count": len(list_items),
+                    # Create pandas DataFrame for list analysis
+                    try:
+                        list_df = pd.DataFrame(
+                            {
+                                "item": list_items,
+                                "item_number": range(1, len(list_items) + 1),
+                                "length": [len(item) for item in list_items],
+                                "word_count": [
+                                    len(item.split()) for item in list_items
+                                ],
+                                "has_numbers": [
+                                    bool(re.search(r"\d", item)) for item in list_items
+                                ],
+                                "has_special_chars": [
+                                    bool(re.search(r"[^\w\s]", item))
+                                    for item in list_items
+                                ],
+                            }
+                        )
+
+                        # Generate list statistics
+                        list_stats = {
+                            "total_items": len(list_items),
+                            "avg_length": list_df["length"].mean(),
+                            "avg_word_count": list_df["word_count"].mean(),
+                            "longest_item": list_df.loc[
+                                list_df["length"].idxmax(), "item"
+                            ]
+                            if not list_df.empty
+                            else "",
+                            "shortest_item": list_df.loc[
+                                list_df["length"].idxmin(), "item"
+                            ]
+                            if not list_df.empty
+                            else "",
+                            "items_with_numbers": list_df["has_numbers"].sum(),
+                            "items_with_special_chars": list_df[
+                                "has_special_chars"
+                            ].sum(),
+                            "length_distribution": list_df["length"]
+                            .describe()
+                            .to_dict(),
                         }
-                    )
+
+                        # Analyze patterns in list items
+                        patterns = analyze_list_patterns(list_items)
+
+                        lists.append(
+                            {
+                                "list_index": i,
+                                "type": list_type,
+                                "context": context,
+                                "items": list_items,
+                                "item_count": len(list_items),
+                                "dataframe": list_df.to_dict("records"),
+                                "statistics": list_stats,
+                                "patterns": patterns,
+                                "pandas_analysis": {
+                                    "dtypes": list_df.dtypes.to_dict(),
+                                    "correlations": list_df.select_dtypes(
+                                        include=[np.number]
+                                    )
+                                    .corr()
+                                    .to_dict()
+                                    if len(
+                                        list_df.select_dtypes(
+                                            include=[np.number]
+                                        ).columns
+                                    )
+                                    > 1
+                                    else {},
+                                },
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error processing list {i} with pandas: {e}")
+                        # Fallback to original format
+                        lists.append(
+                            {
+                                "list_index": i,
+                                "type": list_type,
+                                "context": context,
+                                "items": list_items,
+                                "item_count": len(list_items),
+                            }
+                        )
+
             except Exception as e:
                 logger.warning(f"Error extracting list {i}: {e}")
                 continue
@@ -588,6 +798,58 @@ def extract_structured_lists(page):
         logger.error(f"Error in list extraction: {e}")
 
     return lists
+
+
+def analyze_list_patterns(items: List[str]) -> Dict[str, Any]:
+    """Analyze patterns in list items using pandas."""
+    if not items:
+        return {}
+
+    # Create DataFrame for pattern analysis
+    df = pd.DataFrame({"item": items})
+
+    # Common patterns
+    patterns = {
+        "starts_with_number": df["item"].str.match(r"^\d+").sum(),
+        "starts_with_bullet": df["item"].str.match(r"^[•·▪▫◦‣⁃]").sum(),
+        "contains_colon": df["item"].str.contains(":").sum(),
+        "contains_dash": df["item"].str.contains("-").sum(),
+        "contains_parentheses": df["item"].str.contains(r"\(.*\)").sum(),
+        "all_caps_words": df["item"].str.findall(r"\b[A-Z]{2,}\b").apply(len).sum(),
+        "contains_urls": df["item"].str.contains(r"http[s]?://").sum(),
+        "contains_emails": df["item"]
+        .str.contains(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+        .sum(),
+    }
+
+    # Length patterns
+    lengths = df["item"].str.len()
+    patterns.update(
+        {
+            "length_variance": lengths.var(),
+            "consistent_length": (lengths.max() - lengths.min())
+            < 10,  # Low variance in length
+            "similar_structure": check_similar_structure(items),
+        }
+    )
+
+    # Convert NumPy types to native Python types for JSON serialization
+    patterns = convert_numpy_types(patterns)
+
+    return patterns
+
+
+def check_similar_structure(items: List[str]) -> bool:
+    """Check if list items have similar structure."""
+    if len(items) < 3:
+        return False
+
+    # Simple structure check: similar number of words
+    word_counts = [len(item.split()) for item in items]
+    avg_words = sum(word_counts) / len(word_counts)
+    variance = sum((x - avg_words) ** 2 for x in word_counts) / len(word_counts)
+
+    return variance < 2.0  # Low variance suggests similar structure
 
 
 def find_list_context(list_element):

@@ -25,20 +25,61 @@ class ProxyInfo:
     last_used: Optional[float] = None
     success_count: int = 0
     failure_count: int = 0
-    is_working: bool = True
+    is_working: Optional[bool] = (
+        True  # None = untested, True = working, False = not working
+    )
 
 
 class ProxyManager:
     """Manages a pool of free proxy servers with rotation and health checking."""
 
-    def __init__(self, max_proxies: int = 20, test_timeout: int = 10):
+    def __init__(self, max_proxies: int = 10, test_timeout: int = 5):
         self.max_proxies = max_proxies
         self.test_timeout = test_timeout
         self.proxies: List[ProxyInfo] = []
         self.current_index = 0
         self.lock = Lock()
         self._last_refresh: float = 0
-        self.refresh_interval = 300  # Refresh every 5 minutes
+        self.refresh_interval = 600  # Refresh every 10 minutes (increased)
+        self._cached_proxy_urls: List[str] = []  # Cache fetched but untested proxies
+        self._last_fetch: float = 0
+        self.fetch_interval = 300  # Fetch new proxy URLs every 5 minutes
+
+    def fetch_proxy_urls_lazily(self) -> List[str]:
+        """Fetch proxy URLs and cache them without testing."""
+        current_time = time.time()
+
+        # Check if we need to refresh cached URLs
+        if (
+            current_time - self._last_fetch
+        ) > self.fetch_interval or not self._cached_proxy_urls:
+            logger.info("Fetching fresh proxy URLs...")
+
+            # Try free-proxy library first
+            try:
+                proxy_list = FreeProxy().get_proxy_list(repeat=1)  # Get 300 proxies
+                if proxy_list:
+                    # Limit to 20 for faster processing
+                    self._cached_proxy_urls = [
+                        f"http://{proxy}" for proxy in proxy_list[:20]
+                    ]
+                    logger.info(
+                        f"Fetched {len(self._cached_proxy_urls)} proxy URLs from free-proxy"
+                    )
+                else:
+                    raise Exception("No proxies from free-proxy")
+            except Exception as e:
+                logger.warning(f"Free-proxy failed: {e}, falling back to web sources")
+                # Fallback to web sources
+                web_proxies = self.get_proxies_from_web()
+                self._cached_proxy_urls = [f"http://{proxy}" for proxy in web_proxies]
+                logger.info(
+                    f"Fetched {len(self._cached_proxy_urls)} proxy URLs from web sources"
+                )
+
+            self._last_fetch = current_time
+
+        return self._cached_proxy_urls.copy()
 
     def get_proxies_from_web(self) -> List[str]:
         """Get proxies by scraping public proxy lists."""
@@ -208,33 +249,23 @@ class ProxyManager:
         return proxy_info
 
     def refresh_proxy_pool(self, force: bool = False) -> None:
-        """Refresh the proxy pool with new working proxies."""
+        """Refresh the proxy pool with lazy loading - only fetch URLs, test on-demand."""
         current_time = time.time()
 
         if not force and current_time - self._last_refresh < self.refresh_interval:
             return
 
         with self.lock:
-            logger.info("Refreshing proxy pool...")
+            logger.info("Refreshing proxy pool (lazy loading)...")
 
-            # Get fresh proxies
-            fresh_proxy_urls = self.get_fresh_proxies(self.max_proxies * 2)
+            # Get cached proxy URLs without testing them
+            fresh_proxy_urls = self.fetch_proxy_urls_lazily()
 
             if not fresh_proxy_urls:
-                logger.warning("No fresh proxies found")
+                logger.warning("No fresh proxy URLs found")
                 return
 
-            # Test new proxies
-            working_proxies: List[ProxyInfo] = []
-            for proxy_url in fresh_proxy_urls:
-                if len(working_proxies) >= self.max_proxies:
-                    break
-
-                proxy_info = self.test_proxy(proxy_url)
-                if proxy_info.is_working:
-                    working_proxies.append(proxy_info)
-
-            # Keep some of the best existing proxies if they're still working
+            # Keep existing working proxies
             existing_good_proxies = [
                 p
                 for p in self.proxies
@@ -243,42 +274,83 @@ class ProxyManager:
                 and p.success_count > p.failure_count
             ]
 
-            # Combine and limit to max_proxies
-            all_proxies = working_proxies + existing_good_proxies
-            self.proxies = sorted(
-                all_proxies, key=lambda x: (x.failure_count, -x.success_count)
-            )[: self.max_proxies]
+            # Add new proxy URLs as untested proxies (lazy approach)
+            new_proxies: List[ProxyInfo] = []
+            for proxy_url in fresh_proxy_urls:
+                if len(existing_good_proxies) + len(new_proxies) >= self.max_proxies:
+                    break
 
-            self._last_refresh = current_time
+                # Check if we already have this proxy
+                if not any(p.proxy_url == proxy_url for p in existing_good_proxies):
+                    proxy_info = ProxyInfo(proxy_url=proxy_url)
+                    proxy_info.is_working = None  # Mark as untested
+                    new_proxies.append(proxy_info)
+
+            # Combine existing good proxies with new untested ones
+            self.proxies = existing_good_proxies + new_proxies
             self.current_index = 0
+            self._last_refresh = current_time
 
             logger.info(
-                f"Proxy pool refreshed with {len(self.proxies)} working proxies"
+                f"Proxy pool refreshed with {len(existing_good_proxies)} working proxies "
+                f"and {len(new_proxies)} untested proxies (lazy loading)"
             )
 
     def get_proxy(self) -> Optional[Dict[str, str]]:
-        """Get the next proxy in rotation."""
+        """Get the next proxy in rotation, testing on-demand."""
         # Refresh if needed
         self.refresh_proxy_pool()
 
         if not self.proxies:
-            logger.warning("No working proxies available")
+            logger.warning("No proxies available")
             return None
 
+        # First, try to find an already working proxy
         with self.lock:
-            # Find next working proxy
-            attempts = 0
-            while attempts < len(self.proxies):
-                proxy_info = self.proxies[self.current_index]
-                self.current_index = (self.current_index + 1) % len(self.proxies)
-
-                if proxy_info.is_working:
+            for proxy_info in self.proxies:
+                if proxy_info.is_working is True:
                     proxy_info.last_used = time.time()
                     return {"http": proxy_info.proxy_url, "https": proxy_info.proxy_url}
 
-                attempts += 1
+        # If no working proxies, test untested ones on-demand
+        max_attempts = min(len(self.proxies), 5)  # Test up to 5 proxies
+        attempts = 0
 
-        logger.warning("No working proxies found in rotation")
+        while attempts < max_attempts:
+            proxy_to_test = None
+
+            # Find next untested proxy
+            with self.lock:
+                for proxy_info in self.proxies:
+                    if proxy_info.is_working is None:  # Untested
+                        proxy_to_test = proxy_info
+                        break
+
+            if not proxy_to_test:
+                break  # No more untested proxies
+
+            attempts += 1
+            logger.info(
+                f"Testing proxy on-demand ({attempts}/{max_attempts}): {proxy_to_test.proxy_url}"
+            )
+            tested_info = self.test_proxy(proxy_to_test.proxy_url)
+
+            # Update the proxy info with test results
+            with self.lock:
+                for p in self.proxies:
+                    if p.proxy_url == proxy_to_test.proxy_url:
+                        p.is_working = tested_info.is_working
+                        p.response_time = tested_info.response_time
+                        p.success_count = tested_info.success_count
+                        p.failure_count = tested_info.failure_count
+
+                        if p.is_working:
+                            p.last_used = time.time()
+                            logger.info(f"Found working proxy: {p.proxy_url}")
+                            return {"http": p.proxy_url, "https": p.proxy_url}
+                        break
+
+        logger.warning(f"No working proxies found after testing {attempts} proxies")
         return None
 
     def report_proxy_result(self, proxy_dict: Dict[str, str], success: bool) -> None:
