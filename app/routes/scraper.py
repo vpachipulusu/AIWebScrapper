@@ -1,13 +1,21 @@
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
-from app.services.playwright_service import (
+
+# Import from new refactored services
+from app.services.playwright_scraping_service import (
     ContentType,
     CustomSelector,
     ScrapeRequest,
     scrape_specific_page_content,
 )
+from app.services.beautifulsoup_scraping_service import (
+    run_scraper,
+    run_scraper_with_pandas,
+    beautifulsoup_service,
+)
+
+# Keep legacy imports for backward compatibility
 from app.services.beautifulsoup_service import sync_scrape_with_beautifulsoup
-from app.services.scraper_service import run_scraper, run_scraper_with_pandas
 from app.services.selectolax_service import scrape_page as selectolax_scrape_page
 from app.services.proxy_service import (
     refresh_proxies,
@@ -327,6 +335,51 @@ async def scrape_with_beautifulsoup_pandas(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Enhanced scraping failed: {str(e)}"
+        )
+
+
+# New generic endpoint using the base service architecture
+@router.post("/scrape-generic")
+async def scrape_with_generic_service(
+    request: ScrapeRequest,
+    service_type: str = Query(
+        "beautifulsoup", description="Service type: 'beautifulsoup' or 'playwright'"
+    ),
+    use_proxy: bool = Query(True, description="Whether to use proxy rotation"),
+):
+    """
+    Generic scraping endpoint that can use either BeautifulSoup or Playwright
+    based on the service_type parameter. Both services now share common functionality
+    through the BaseScrapingService class.
+    """
+    try:
+        if service_type.lower() == "playwright":
+            # Use Playwright service for dynamic content
+            result = await scrape_specific_page_content(request)
+        else:
+            # Use BeautifulSoup service for static content
+            from app.services.beautifulsoup_scraping_service import (
+                beautifulsoup_service,
+            )
+
+            result = beautifulsoup_service.scrape_and_process(str(request.url))
+
+        return {
+            "status": "success",
+            "service_used": service_type,
+            "data": result,
+            "features": [
+                "Unified data extraction interface",
+                "Table and list processing with pandas",
+                "Automatic NumPy type conversion",
+                "Comprehensive statistical analysis",
+                "Generic base service architecture",
+                "Service-agnostic data processing",
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Generic scraping failed: {str(e)}"
         )
 
 
